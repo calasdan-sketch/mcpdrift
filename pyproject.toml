@@ -8,6 +8,7 @@ version = "0.1.0"
 description = "Pin your MCP servers' tool surface in a lockfile and fail CI when it drifts"
 readme = "README.md"
 requires-python = ">=3.9"
+license = "MIT"
 authors = [{ name = "calasdan-sketch" }]
 keywords = ["mcp", "model-context-protocol", "lockfile", "drift", "ci", "agents"]
 classifiers = [
