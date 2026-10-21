@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcpdrift"
+version = "0.1.0"
+description = "Pin your MCP servers' tool surface in a lockfile and fail CI when it drifts"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "calasdan-sketch" }]
+keywords = ["mcp", "model-context-protocol", "lockfile", "drift", "ci", "agents"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Environment :: Console",
+    "Topic :: Software Development :: Quality Assurance",
+]
+
+[project.scripts]
+mcpdrift = "mcpdrift.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
