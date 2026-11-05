@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 from . import __version__
 from .canon import diff_raw, diff_surfaces, sha256_of, surface_digests
 from .client import PROTOCOL_VERSION, MCPError, fetch_surface, surface_from_file
-from .render import render_github, render_json, render_markdown, render_text
+from .render import render_github, render_json, render_markdown, render_text, stop_commands
 from .risk import SEVERITIES, Assessed, assess_changes, max_severity, rank, scan_surface
 from .sign import SignError, sign_lock, verify_lock
 
@@ -70,12 +70,28 @@ def _server_label(args: argparse.Namespace) -> str:
     return next(iter(load_servers(args.config)))
 
 
+def _target_mode(path: str) -> int:
+    """Keep an existing file's permissions; new files get 0644 minus umask
+    (mkstemp alone would leave a committed lockfile at 0600)."""
+    try:
+        return os.stat(path).st_mode & 0o7777
+    except OSError:
+        umask = os.umask(0)
+        os.umask(umask)
+        return 0o644 & ~umask
+
+
 def _atomic_write(path: str, text: str) -> None:
     d = os.path.dirname(os.path.abspath(path))
+    mode = _target_mode(path)
     fd, tmp = tempfile.mkstemp(prefix=".mcpdrift-", dir=d)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
+        try:
+            os.chmod(tmp, mode)
+        except OSError:
+            pass
         os.replace(tmp, path)
     except BaseException:
         try:
@@ -152,7 +168,7 @@ def _emit(items: List[Assessed], fmt: str, lock_path: str = "", extra: Optional[
         sys.stdout.write(render_markdown(items, **(_SCAN_MD if scan else {})))
     elif fmt == "github":
         sys.stdout.write(render_github(items, lock_path))
-        sys.stdout.write(render_text(items, **kw))
+        sys.stdout.write(stop_commands(render_text(items, **kw)))
     else:
         color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         sys.stdout.write(render_text(items, color=color, **kw))
@@ -175,11 +191,38 @@ def _exit_for(items: List[Assessed], fail_on: str) -> int:
 # commands
 
 
+def _previous_seq(path: Optional[str]) -> int:
+    if not path or path == "-" or not os.path.exists(path):
+        return 0
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            prev = json.load(fh)
+        seq = prev.get("seq", 0) if isinstance(prev, dict) else 0
+        return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def _check_rollback(lock: Dict[str, Any], prev_path: str) -> None:
+    """Reject a lock that is older than (or forks from) the previous one."""
+    prev = _read_lock(prev_path)
+    p_seq, l_seq = prev.get("seq"), lock.get("seq")
+    if p_seq is None:
+        return  # previous lock predates sequence numbers: nothing to compare
+    if not isinstance(l_seq, int) or isinstance(l_seq, bool):
+        raise _Exit(INTEGRITY_EXIT, "mcpdrift: lockfile has no seq but the previous one does (rollback?)")
+    if l_seq < p_seq:
+        raise _Exit(INTEGRITY_EXIT, f"mcpdrift: lockfile seq {l_seq} is older than previous seq {p_seq} (rollback)")
+    if l_seq == p_seq and sha256_of(lock.get("surface", {})) != sha256_of(prev.get("surface", {})):
+        raise _Exit(INTEGRITY_EXIT, f"mcpdrift: lockfile reuses seq {l_seq} with a different surface")
+
+
 def cmd_snapshot(args: argparse.Namespace) -> int:
     surface = _live_surface(args, args.server)
     lock = {
         "mcpdrift": __version__,
         "lockfile_version": LOCKFILE_VERSION,
+        "seq": _previous_seq(args.out) + 1,
         "server": _server_label(args),
         "snapshot_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "digests": surface_digests(surface),
@@ -215,6 +258,8 @@ def cmd_check(args: argparse.Namespace) -> int:
     verified = _verify(args, lock)
     if verified:
         print(f"mcpdrift: {verified}", file=sys.stderr)
+    if args.previous_lock:
+        _check_rollback(lock, args.previous_lock)
     live = _live_surface(args, args.server or lock.get("server") if not args.from_file else args.server)
     old = lock.get("surface", {})
     ignore = list(args.ignore or [])
@@ -323,7 +368,9 @@ def build_parser() -> argparse.ArgumentParser:
     c.add_argument("--ignore", action="append", help="glob pattern of paths to ignore (repeatable)")
     c.add_argument("--ignore-file", metavar="FILE", help="file of ignore globs, one per line, # comments")
     c.add_argument("--json", action="store_true", help="legacy 0.1 JSON shape (prefer --format json)")
-    _output_args(c, "info")
+    c.add_argument("--previous-lock", metavar="FILE",
+                   help="the lock from the base branch; fail (exit 3) if this lock rolls its seq back")
+    _output_args(c, "low")
     _verify_args(c)
     c.set_defaults(func=cmd_check)
 
@@ -346,7 +393,18 @@ def build_parser() -> argparse.ArgumentParser:
     return ap
 
 
+def _safe_streams() -> None:
+    # A Windows console (cp1252) cannot encode every character a server may
+    # put in a description; never crash on output.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")  # type: ignore[attr-defined]
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _safe_streams()
     ap = build_parser()
     args = ap.parse_args(argv)
     if args.cmd == "verify" and not args.allowed_signers:

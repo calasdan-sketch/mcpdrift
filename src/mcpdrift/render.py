@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import secrets
 from typing import Any, Dict, List, Optional, Sequence
 
 from .risk import Assessed, max_severity
@@ -27,6 +28,11 @@ def _visible(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+def _oneline(text: str) -> str:
+    """Visible and single-line: names/paths/reasons must never break a line."""
+    return _visible(text).replace("\n", "\\n").replace("\t", "\\t")
 
 
 def word_diff(old: str, new: str) -> str:
@@ -81,14 +87,14 @@ def render_text(items: Sequence[Assessed], color: bool = False, noun: str = "dri
         tag = a.severity.upper()
         if color:
             tag = colors[a.severity] + tag + reset
-        lines.append(f"{tag:<{8 + (len(colors[a.severity]) + len(reset) if color else 0)}} {a.kind:7} {_visible(a.path)}")
+        lines.append(f"{tag:<{8 + (len(colors[a.severity]) + len(reset) if color else 0)}} {a.kind:7} {_oneline(a.path)}")
         for r in a.reasons:
-            lines.append(f"           - {_visible(r)}")
+            lines.append(f"           - {_oneline(r)}")
         diff = _text_diff(a)
         if diff is not None:
             lines.append("           " + diff.replace("\n", "\n           "))
         else:
-            lines.append("           " + _visible(a.detail))
+            lines.append("           " + _oneline(a.detail))
     lines.append("")
     lines.append(f"{len(items)} {noun}: {_counts_line(items)}")
     return "\n".join(lines) + "\n"
@@ -96,13 +102,18 @@ def render_text(items: Sequence[Assessed], color: bool = False, noun: str = "dri
 
 def _md_escape(text: str) -> str:
     text = _visible(text)
-    for ch in "\\`*_[]|#!":
+    for ch in "\\`*_[]|#!~":
         text = text.replace(ch, "\\" + ch)
-    return text.replace("<", "&lt;").replace(">", "&gt;").replace("\n", " ")
+    text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", " ")
+    # Stop GitHub auto-linking attacker-chosen URLs / emails / mentions.
+    text = re.sub(r"(?i)(https?|ftp|wss?|file)://", lambda m: m.group(1) + ":&#8203;//", text)
+    text = re.sub(r"(?i)www\.", "www&#8203;.", text)
+    return text.replace("@", "@&#8203;")
 
 
 def render_markdown(items: Sequence[Assessed], title: str = "mcpdrift", noun: str = "drift finding(s)",
                     empty: str = "no drift\n\nThe live MCP surface matches the lockfile.") -> str:
+    title = _md_escape(title)
     if not items:
         return f"### {title}: {empty}\n"
     worst = max_severity(a.severity for a in items)
@@ -142,6 +153,14 @@ def _gh_escape(text: str) -> str:
 
 def _gh_prop(text: str) -> str:
     return _gh_escape(text).replace(":", "%3A").replace(",", "%2C")
+
+
+def stop_commands(text: str) -> str:
+    """Wrap untrusted text so the GitHub runner will not execute any
+    ``::command::`` lines inside it (``::stop-commands::`` with a random,
+    unguessable resume token)."""
+    token = secrets.token_hex(16)
+    return f"::stop-commands::{token}\n{text}{'' if text.endswith(chr(10)) else chr(10)}::{token}::\n"
 
 
 def render_github(items: Sequence[Assessed], lock_path: str = "") -> str:

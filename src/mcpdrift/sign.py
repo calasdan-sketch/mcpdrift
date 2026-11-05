@@ -6,12 +6,16 @@ to sign git commits, and the same ``allowed_signers`` file format git uses.
 What is signed is a short, canonical statement that is *recomputed from the
 lockfile's surface* at verify time, never read from the lockfile itself:
 
-    mcpdrift-lock v2
+    mcpdrift-lock v3
     server: <name>
+    seq: <monotonic integer>
+    snapshot_at: <timestamp>
     surface-sha256: <hex>
 
-So editing any tool, description or schema in the lock breaks the signature,
-while cosmetic fields (``snapshot_at``) do not.
+Editing any tool, description or schema, the sequence number or the
+timestamp breaks the signature. ``seq`` lets CI reject a *rollback*: an
+attacker replaying an older, validly signed lock (see ``check
+--previous-lock``).
 """
 from __future__ import annotations
 
@@ -35,11 +39,18 @@ def signing_payload(lock: Dict[str, Any]) -> bytes:
     if not isinstance(surface, dict):
         raise SignError("lockfile has no surface to sign")
     server = str(lock.get("server") or "")
-    if "\n" in server or "\r" in server:
-        raise SignError("server name contains a newline")
+    stamp = str(lock.get("snapshot_at") or "")
+    seq = lock.get("seq", 0)
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        raise SignError("lockfile seq must be a non-negative integer")
+    for label, value in (("server name", server), ("snapshot_at", stamp)):
+        if any(c in value for c in "\r\n"):
+            raise SignError(f"{label} contains a newline")
     return (
-        "mcpdrift-lock v2\n"
+        "mcpdrift-lock v3\n"
         f"server: {server}\n"
+        f"seq: {seq}\n"
+        f"snapshot_at: {stamp}\n"
         f"surface-sha256: {sha256_of(surface)}\n"
     ).encode("utf-8")
 

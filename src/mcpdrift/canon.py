@@ -108,14 +108,47 @@ def join_path(parts: Iterable[str]) -> str:
     return ".".join(parts)
 
 
-def _suppressor(ignore: Iterable[str]):
-    patterns = [p for p in ignore if p]
+def split_pattern(pattern: str) -> Tuple[str, ...]:
+    """Split an ignore glob on unescaped dots; ``\\.`` is a literal dot, so
+    ``tools.fs\\.read`` targets a tool literally named ``fs.read``."""
+    segs, cur, i = [], [], 0
+    while i < len(pattern):
+        ch = pattern[i]
+        if ch == "\\" and i + 1 < len(pattern) and pattern[i + 1] == ".":
+            cur.append(".")
+            i += 2
+            continue
+        if ch == ".":
+            segs.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+        i += 1
+    segs.append("".join(cur))
+    return tuple(segs)
 
-    def suppressed(path: str) -> bool:
-        return any(
-            fnmatch.fnmatchcase(path, pat) or path.startswith(pat + ".")
-            for pat in patterns
-        )
+
+def _match_prefix(pat: Tuple[str, ...], parts: Tuple[str, ...]) -> bool:
+    """True when ``pat`` matches ``parts`` or an ancestor of it, one path
+    segment per glob segment (``*`` never crosses a segment; ``**`` matches
+    any number of segments). Matching on segments, not the dot-joined
+    string, means ``tools.search`` can never hide a new tool named
+    ``search.exfil``."""
+    if not pat:
+        return True  # matched an ancestor: hides everything beneath
+    head, rest = pat[0], pat[1:]
+    if head == "**":
+        return any(_match_prefix(rest, parts[i:]) for i in range(len(parts) + 1))
+    if not parts:
+        return False
+    return fnmatch.fnmatchcase(parts[0], head) and _match_prefix(rest, parts[1:])
+
+
+def _suppressor(ignore: Iterable[str]):
+    patterns = [split_pattern(p) for p in ignore if p]
+
+    def suppressed(parts: Tuple[str, ...]) -> bool:
+        return any(_match_prefix(pat, parts) for pat in patterns)
 
     return suppressed
 
@@ -128,17 +161,17 @@ def diff_raw(old: Any, new: Any, ignore: Iterable[str] = ()) -> List[RawChange]:
     stack: List[Tuple[Any, Any, Tuple[str, ...]]] = [(old, new, ())]
     while stack:
         o, n, parts = stack.pop()
-        if parts and suppressed(join_path(parts)):
+        if parts and suppressed(parts):
             continue
         if isinstance(o, dict) and isinstance(n, dict):
             # push in reverse so findings come out sorted
             for k in sorted(set(o) | set(n), reverse=True):
                 p = parts + (str(k),)
                 if k not in n:
-                    if not suppressed(join_path(p)):
+                    if not suppressed(p):
                         changes.append(("removed", p, o[k], _MISSING))
                 elif k not in o:
-                    if not suppressed(join_path(p)):
+                    if not suppressed(p):
                         changes.append(("added", p, _MISSING, n[k]))
                 else:
                     stack.append((o[k], n[k], p))
@@ -158,9 +191,9 @@ def diff_surfaces(
 ) -> List[Finding]:
     """Structural diff of two canonical surfaces.
 
-    ``ignore`` entries are glob patterns matched against the dotted path of a
-    finding, e.g. ``server.version``, ``tools.search.*`` or ``prompts.*``.
-    Ignoring a node hides every finding beneath it.
+    ``ignore`` entries are dotted glob patterns matched segment by segment,
+    e.g. ``server.version``, ``tools.search.*``, ``tools.*.description`` or
+    ``**.description``. Ignoring a node hides every finding beneath it.
     """
     findings: List[Finding] = []
     for kind, parts, o, n in diff_raw(old, new, ignore):

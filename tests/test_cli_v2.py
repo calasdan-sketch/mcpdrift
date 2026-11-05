@@ -33,8 +33,8 @@ def test_fail_on_threshold(tmp_path):
     v2 = json.loads(json.dumps(V1))
     v2["initialize"]["serverInfo"]["version"] = "1.0.1"
     f = write(tmp_path, "v2.json", v2)
-    assert main(["check", "--from-file", f, "--lock", lock]) == 1          # default: any drift
-    assert main(["check", "--from-file", f, "--lock", lock, "--fail-on", "low"]) == 0
+    assert main(["check", "--from-file", f, "--lock", lock]) == 0          # default low: info passes
+    assert main(["check", "--from-file", f, "--lock", lock, "--fail-on", "info"]) == 1
     assert main(["check", "--from-file", f, "--lock", lock, "--fail-on", "never"]) == 0
 
 
@@ -190,3 +190,137 @@ def test_oversized_message_is_rejected(monkeypatch):
     src = "import sys\nfor l in sys.stdin:\n print('x'*5000, flush=True)\n"
     with pytest.raises(MCPError, match="larger than"):
         fetch_surface({"command": [sys.executable, "-c", src]}, timeout=10)
+
+
+# ---- panel review fixes -----------------------------------------------------
+
+def test_ignore_glob_cannot_hide_new_dotted_tool():
+    from mcpdrift.canon import build_surface, diff_surfaces
+    a = build_surface({}, [{"name": "search", "description": "s"}])
+    b = build_surface({}, [{"name": "search", "description": "s"}, {"name": "search.exfil", "description": "x"}])
+    for pat in ("tools.search", "tools.search.*", "tools.search*.description"):
+        assert any(p == "tools.search.exfil" for _, p, _ in diff_surfaces(a, b, ignore=[pat])), pat
+    assert diff_surfaces(a, b, ignore=[r"tools.search\.exfil"]) == []
+    assert diff_surfaces(a, b, ignore=["tools.*"]) == []
+
+
+def test_ignore_double_star_and_single_star_segments():
+    from mcpdrift.canon import build_surface, diff_surfaces
+    t = lambda d: [{"name": "t", "description": "a", "inputSchema": {"properties": {"q": {"description": d}}}}]
+    a, b = build_surface({}, t("x")), build_surface({}, t("y"))
+    assert diff_surfaces(a, b, ignore=["tools.*.description"]) != []   # * does not cross segments
+    assert diff_surfaces(a, b, ignore=["**.description"]) == []
+
+
+def test_lock_and_sig_file_modes(tmp_path):
+    import os
+    import stat
+    if os.name == "nt":
+        return
+    f = write(tmp_path, "v1.json", V1)
+    lock = tmp_path / "mcp.lock.json"
+    old = os.umask(0o022)
+    try:
+        assert main(["snapshot", "--from-file", f, "--out", str(lock)]) == 0
+        assert stat.S_IMODE(os.stat(lock).st_mode) == 0o644
+        os.chmod(lock, 0o664)
+        assert main(["snapshot", "--from-file", f, "--out", str(lock)]) == 0
+        assert stat.S_IMODE(os.stat(lock).st_mode) == 0o664
+    finally:
+        os.umask(old)
+
+
+def test_seq_increments(tmp_path):
+    f = write(tmp_path, "v1.json", V1)
+    lock = tmp_path / "l.json"
+    for expected in (1, 2, 3):
+        main(["snapshot", "--from-file", f, "--out", str(lock)])
+        assert json.loads(lock.read_text())["seq"] == expected
+
+
+def test_rollback_unsigned_and_missing_seq(tmp_path):
+    f = write(tmp_path, "v1.json", V1)
+    a, b = tmp_path / "a.json", tmp_path / "b.json"
+    main(["snapshot", "--from-file", f, "--out", str(a)])
+    b.write_text(a.read_text())
+    main(["snapshot", "--from-file", f, "--out", str(b)])  # seq 2
+    assert main(["check", "--from-file", f, "--lock", str(a), "--previous-lock", str(b)]) == 3
+    data = json.loads(a.read_text()); del data["seq"]; a.write_text(json.dumps(data))
+    assert main(["check", "--from-file", f, "--lock", str(a), "--previous-lock", str(b)]) == 3
+
+
+def test_github_format_text_block_is_command_proof(tmp_path, capsys):
+    lock = snap(tmp_path)
+    evil = json.loads(json.dumps(V1))
+    evil["tools"].append({"name": "x\n::error title=pwn::forged\r\n::add-mask::y", "description": "d"})
+    evil["tools"][0]["description"] = "line\n::warning::forged-too"
+    f = write(tmp_path, "evil.json", evil)
+    main(["check", "--from-file", f, "--lock", lock, "--format", "github"])
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    start = next(i for i, ln in enumerate(lines) if ln.startswith("::stop-commands::"))
+    token = lines[start].split("::")[2]
+    assert len(token) == 32 and lines[-1] == f"::{token}::"
+    # before the stop-commands block only our own annotations may start with ::
+    for ln in lines[:start]:
+        assert ln.startswith(("::error ", "::warning ", "::notice ")) and "\n" not in ln
+        assert "title=mcpdrift " in ln.split("::", 2)[1]  # our own properties only
+    assert any("control characters" in ln and "%0A" in ln for ln in lines[:start])
+    # nothing between the markers can be a live command: the runner ignores it
+    assert all(not ln.startswith("::") for ln in lines[start + 1:-1])
+
+
+def test_server_stderr_cannot_forge_commands():
+    from mcpdrift.client import _sanitize
+    assert "::" not in _sanitize("::error::boom\x1b[31m")
+
+
+def test_total_byte_cap(monkeypatch):
+    import pytest
+    from mcpdrift import client
+    from mcpdrift.client import MCPError
+    monkeypatch.setattr(client, "MAX_TOTAL_BYTES", 2000)
+    src = "import sys\nfor l in sys.stdin:\n for _ in range(10): print('x'*800, flush=True)\n"
+    with pytest.raises(MCPError, match="in total"):
+        fetch_surface({"command": [sys.executable, "-c", src]}, timeout=10)
+
+
+def test_command_resolved_via_path(tmp_path, monkeypatch):
+    import os
+    import stat
+    if os.name == "nt":
+        return
+    script = tmp_path / "fake-mcp"
+    script.write_text("#!" + sys.executable + "\nimport sys\nfor l in sys.stdin:\n"
+                      " import json; m=json.loads(l)\n"
+                      " 'id' in m and print(json.dumps({'jsonrpc':'2.0','id':m['id'],'result':{}}), flush=True)\n")
+    script.chmod(script.stat().st_mode | stat.S_IEXEC)
+    s = fetch_surface({"command": "fake-mcp", "env": {"PATH": str(tmp_path) + os.pathsep + os.environ["PATH"]}}, timeout=10)
+    assert s["tools"] == {}
+
+
+def test_unencodable_output_does_not_crash(tmp_path, monkeypatch):
+    import io
+    lock = snap(tmp_path)
+    v2 = json.loads(json.dumps(V1))
+    v2["tools"][0]["description"] = "☃ \U0001f600 рау"
+    f = write(tmp_path, "v2.json", v2)
+    raw = io.BytesIO()
+    fake = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", fake)
+    assert main(["check", "--from-file", f, "--lock", lock]) == 1
+    fake.flush()
+    assert b"\\u2603" in raw.getvalue() or b"\\N" in raw.getvalue() or b"\\x" in raw.getvalue()
+
+
+def test_markdown_title_escaped_and_urls_not_autolinked():
+    from mcpdrift.canon import build_surface, diff_raw
+    from mcpdrift.render import render_markdown
+    from mcpdrift.risk import assess_changes
+    a = build_surface({}, [{"name": "t", "description": "a"}])
+    b = build_surface({}, [{"name": "t", "description": "see https://evil.example and www.evil.example @admin"}])
+    md = render_markdown(assess_changes(diff_raw(a, b), a, b), title="mcpdrift: <img src=x> [x](https://e)")
+    head = md.splitlines()[0]
+    assert "<img" not in head and "[x](" not in head
+    table = "\n".join(ln for ln in md.splitlines() if ln.startswith("| "))
+    assert "https://" not in table and "www.evil" not in table and "@admin" not in table

@@ -80,13 +80,20 @@ INFO     changed server.version
 
 Useful options:
 
-- `--fail-on {info,low,medium,high,critical,never}`: the default for `check` is `info`, so any drift fails, as in 0.1. Use `--fail-on high` to let routine releases through but stop rug pulls.
+- `--fail-on {info,low,medium,high,critical,never}`: the default for `check` is `low`, so everything except an `info` finding (a bare version bump) fails. Use `--fail-on info` to fail on any drift at all, as 0.1 did, or `--fail-on high` to let routine releases through but stop rug pulls.
 - `--format {text,json,markdown,github}`, plus `--markdown-out FILE`, which appends a report (point it at `$GITHUB_STEP_SUMMARY`).
-- `--ignore 'server.version'` (repeatable globs on the dotted path) or `--ignore-file .mcpdriftignore`.
+- `--ignore 'server.version'` (repeatable) or `--ignore-file .mcpdriftignore`. Globs are matched **one path segment at a time**:
+  - `*` never crosses a dot, and `**` matches any depth.
+  - `tools.fs\.read` targets a tool literally named `fs.read`.
+  - Ignoring a node hides everything beneath it.
+  - `tools.search` can never hide a new tool called `search.exfil`.
+- `--previous-lock base.lock.json` fails with exit `3` if the lock's `seq` went backwards, which catches replay of an older signed lock.
 - `--from-file listing.json` checks a saved `tools/list` response (raw result, JSON-RPC response, bare list, or `{"initialize":…, "tools":…, "resources":…, "prompts":…}`) **without executing anything**. This is the safe way to vet an untrusted server.
 - `--allowed-signers FILE --identity you@example.com` on `check` makes a valid `<lock>.sig` mandatory.
 
-Exit codes: `0` ok · `1` drift at/above `--fail-on` · `2` usage or server error · `3` lockfile integrity or signature failure.
+Exit codes: `0` ok · `1` drift at/above `--fail-on` · `2` usage or server error · `3` lockfile integrity, signature or rollback failure.
+
+Safety limits: messages over 16 MiB, more than 64 MiB from one server, more than 1000 pages or 50,000 entries are refused, never silently truncated. Output never crashes on a console that can't encode a character (such as Windows cp1252). Commands resolve through `PATH`/`PATHEXT`, so `npx` finds `npx.cmd`.
 
 ## GitHub Action
 
@@ -99,9 +106,16 @@ Exit codes: `0` ok · `1` drift at/above `--fail-on` · `2` usage or server erro
     fail-on: medium            # routine version bumps pass; breaking or risky changes fail
     ignore: |
       server.version
+    # optional, recommended with signed locks:
+    allowed-signers: .github/allowed_signers
+    allowed-signers-ref: origin/main      # trust the BASE branch's signers, not the PR's
+    identity: you@example.com
+    previous-lock-ref: origin/main        # reject seq rollback
 ```
 
-The Action installs mcpdrift from its own pinned source, not a floating PyPI version. It emits one annotation per finding and writes a markdown table plus word diffs to the job summary. Inputs reach the script through environment variables, never interpolated into shell. Other inputs are `from-file`, `server`, `allowed-signers`, `identity`, `timeout` and `python-version`, and there is an output called `exit-code`.
+Use `actions/checkout` with `fetch-depth: 0` so the base ref is available. You can also pass `allowed-signers-content: ${{ secrets.MCP_SIGNERS }}`. If signers are read from the PR's own checkout, a malicious PR could add its own key, and the Action warns when you do that.
+
+The Action installs mcpdrift from its own pinned source, not a floating PyPI version. It emits one annotation per finding and writes a markdown table plus word diffs to the job summary. Inputs reach the script through environment variables, never interpolated into shell. The plain-text report is wrapped in `::stop-commands::<random token>`, and annotation text is percent-escaped. Server stderr has `::` defused. So a tool named `x\n::error::...` cannot forge workflow commands. Other inputs are `from-file`, `server`, `timeout` and `python-version`, and there is an output called `exit-code`.
 
 ## Signed lockfiles
 
@@ -112,28 +126,39 @@ mcpdrift check --config .mcp.json --lock mcp.lock.json \
   --allowed-signers .github/allowed_signers --identity you@example.com
 ```
 
-What gets signed is `server` plus a SHA-256 of the canonical surface, and both are **recomputed from the lock at verify time**. Editing any tool, description or schema therefore breaks the signature, while `snapshot_at` does not. Even unsigned, a v2 lock records its own digests. A hand-edited surface fails with exit `3`, and per-tool digests make the lockfile's own PR diff show which tool moved. This needs OpenSSH 8.1+ for `ssh-keygen -Y`.
+What gets signed is `server`, a monotonic `seq` (each `snapshot` over an existing lock adds 1), `snapshot_at`, and a SHA-256 of the canonical surface. All of them are **recomputed from the lock at verify time**, so editing any tool, description, schema, seq or timestamp breaks the signature.
+
+A signature alone cannot stop someone from committing an *older* lock with its valid old signature. Run `check --previous-lock <base branch lock>` (the Action's `previous-lock-ref`) to reject a lower `seq`, or the same `seq` with a different surface.
+
+Keep `allowed_signers` somewhere a pull request can't change: the base branch, or a secret. Even unsigned, a v2 lock records its own digests. A hand-edited surface fails with exit `3`, and per-tool digests make the lockfile's own PR diff show which tool moved. This needs OpenSSH 8.1+ for `ssh-keygen -Y`.
 
 ## How severity is decided
 
 These rules are deterministic, documented, and live in `src/mcpdrift/risk.py`:
 
-- **Text the model reads** covers tool, argument, prompt and resource `description` and `title`, at any nesting depth. It is checked for:
+- **Text the model reads** covers every string in a tool, prompt or resource, at any depth: descriptions and titles, but also `default`, `enum`, `const`, `examples` and unknown fields. It is checked for:
   - invisible, bidi and Unicode-tag characters, and variation-selector runs
-  - mixed-script look-alike words (`pаypal` with a Cyrillic `а`)
-  - hidden-instruction markers (`<IMPORTANT>`, `ignore previous instructions`, `do not tell the user`)
+  - mixed-script look-alike words (`pаypal` with a Cyrillic `а`) and words written entirely in Latin look-alikes (`рау`)
+  - hidden-instruction markers (`<IMPORTANT>`, `ignore previous instructions`, `do not tell the user`), including split or leetspeak forms (`i-g-n-o-r-e`, `1gn0re prev10us`)
+  - HTML comments, base64 blobs that decode to text (the decoded text is scanned too), and control characters
   - secret files (`~/.ssh`, `id_rsa`, `.env`, `mcp.json`, `/etc/passwd`)
   - exfiltration wording aimed at a URL, email, webhook or "sidenote"
   - new URLs
   - references to *other* tools (cross-tool steering)
   - sudden large growth
 
-  Text is NFKC-normalized and invisibles are stripped before matching, so `<IMP​ORTANT>` is still caught. Only signals that are **new** in the changed text count. Two or more strong signals together become `critical`.
+  Text is NFKC-normalized and invisibles are stripped before matching, so `<IMP​ORTANT>` is still caught. Text over 200,000 characters is flagged `high`, and both its head and its tail are scanned. Only signals that are **new** in the changed text count. Two or more strong signals together become `critical`.
 - **Schemas:** a new required argument, a removed argument, a type change, a narrowed enum, or newly rejected extra arguments are each `medium` and tagged `breaking`. Widened schemas are `low` and tagged `widened`. A new argument with a secret-looking name (`ssh_key`, `password`) is `high`.
 - **Annotations:** turning `destructiveHint` on or `readOnlyHint` off is `high`. Turning `openWorldHint` on is `medium`.
 - **Tools:** a removed tool is `medium` (breaking). A new tool is `medium`, and its whole definition and its name are risk-scanned, so a look-alike `read_fіle` shadowing `read_file` is `high`.
 
-Legitimate emoji, unit symbols (`kΩ`, `μs`) and accented or CJK text are covered by tests to make sure they *don't* trigger.
+Tests make sure the following *don't* trigger:
+- legitimate emoji and unit symbols (`kΩ`, `μs`)
+- accented, Cyrillic or CJK text
+- hashes
+- resource URIs
+- "Pass your API key in the header, see https://docs…"
+- "You must first call login"
 
 ## How it compares
 

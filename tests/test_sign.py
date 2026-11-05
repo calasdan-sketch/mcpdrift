@@ -59,9 +59,24 @@ def test_missing_signature_fails(setup):
     assert main(["verify", "--lock", str(lock), "--allowed-signers", str(signers), "--identity", "dev@example.com"]) == 3
 
 
-def test_snapshot_at_change_keeps_signature_valid(setup):
+@pytest.mark.parametrize("field,value", [("snapshot_at", "1999-01-01T00:00:00+00:00"), ("seq", 99)])
+def test_signed_metadata_cannot_be_altered(setup, field, value):
     tmp, key, signers, listing, lock = setup
     data = json.loads(lock.read_text())
-    data["snapshot_at"] = "1999-01-01T00:00:00+00:00"
+    data[field] = value
     lock.write_text(json.dumps(data))
-    assert main(["verify", "--lock", str(lock), "--allowed-signers", str(signers), "--identity", "dev@example.com"]) == 0
+    assert main(["verify", "--lock", str(lock), "--allowed-signers", str(signers), "--identity", "dev@example.com"]) == 3
+
+
+def test_rollback_to_older_signed_lock_is_rejected(setup):
+    tmp, key, signers, listing, lock = setup
+    old = tmp / "old.lock.json"
+    old.write_text(lock.read_text())
+    (tmp / "old.lock.json.sig").write_text((tmp / "mcp.lock.json.sig").read_text())
+    # a newer lock is snapshotted (seq 2) and becomes the base-branch lock
+    assert main(["snapshot", "--from-file", str(listing), "--out", str(lock), "--sign-key", str(key)]) == 0
+    assert json.loads(lock.read_text())["seq"] == 2
+    common = ["--from-file", str(listing), "--allowed-signers", str(signers), "--identity", "dev@example.com"]
+    # replaying the old (validly signed!) lock against the newer base fails
+    assert main(["check", "--lock", str(old), "--previous-lock", str(lock)] + common) == 3
+    assert main(["check", "--lock", str(lock), "--previous-lock", str(old)] + common) == 0

@@ -22,15 +22,33 @@ inputs:
     required: false
     default: ""
   fail-on:
-    description: Lowest severity that fails the job (info, low, medium, high, critical, never).
+    description: Lowest severity that fails the job (info, low, medium, high, critical, never). Version-only bumps are info.
     required: false
-    default: info
+    default: low
   ignore:
     description: Newline-separated glob patterns of paths to ignore (e.g. server.version).
     required: false
     default: ""
   allowed-signers:
-    description: OpenSSH allowed_signers file. When set, <lock>.sig must verify before checking.
+    description: >-
+      Path of an OpenSSH allowed_signers file. When set, <lock>.sig must verify. Read from
+      `allowed-signers-ref` when that is set, so a pull request cannot add its own key.
+    required: false
+    default: ""
+  allowed-signers-ref:
+    description: >-
+      Git ref to read `allowed-signers` from (e.g. origin/main). Use your protected base branch.
+      Needs the ref fetched (actions/checkout with fetch-depth 0).
+    required: false
+    default: ""
+  allowed-signers-content:
+    description: allowed_signers file content, e.g. from a repository secret. Overrides `allowed-signers`.
+    required: false
+    default: ""
+  previous-lock-ref:
+    description: >-
+      Git ref holding the previous lock (e.g. origin/main). The check fails (exit 3) when the lock's
+      seq goes backwards, which stops replay of an older, validly signed lock.
     required: false
     default: ""
   identity:
@@ -71,6 +89,9 @@ runs:
         IN_FAIL_ON: ${{ inputs.fail-on }}
         IN_IGNORE: ${{ inputs.ignore }}
         IN_SIGNERS: ${{ inputs.allowed-signers }}
+        IN_SIGNERS_REF: ${{ inputs.allowed-signers-ref }}
+        IN_SIGNERS_CONTENT: ${{ inputs.allowed-signers-content }}
+        IN_PREV_REF: ${{ inputs.previous-lock-ref }}
         IN_IDENTITY: ${{ inputs.identity }}
         IN_TIMEOUT: ${{ inputs.timeout }}
       run: |
@@ -81,7 +102,24 @@ runs:
         [ -n "$IN_CONFIG" ] && args+=(--config "$IN_CONFIG")
         [ -n "$IN_FROM_FILE" ] && args+=(--from-file "$IN_FROM_FILE")
         [ -n "$IN_SERVER" ] && args+=(--server "$IN_SERVER")
-        [ -n "$IN_SIGNERS" ] && args+=(--allowed-signers "$IN_SIGNERS" --identity "$IN_IDENTITY")
+        tmpd="$(mktemp -d)"
+        if [ -n "$IN_SIGNERS_CONTENT" ]; then
+          printf '%s\n' "$IN_SIGNERS_CONTENT" > "$tmpd/allowed_signers"
+          args+=(--allowed-signers "$tmpd/allowed_signers" --identity "$IN_IDENTITY")
+        elif [ -n "$IN_SIGNERS" ] && [ -n "$IN_SIGNERS_REF" ]; then
+          git show "$IN_SIGNERS_REF:$IN_SIGNERS" > "$tmpd/allowed_signers"
+          args+=(--allowed-signers "$tmpd/allowed_signers" --identity "$IN_IDENTITY")
+        elif [ -n "$IN_SIGNERS" ]; then
+          echo "::warning title=mcpdrift::allowed-signers is read from the PR's own checkout; set allowed-signers-ref or allowed-signers-content so a PR cannot add its own key"
+          args+=(--allowed-signers "$IN_SIGNERS" --identity "$IN_IDENTITY")
+        fi
+        if [ -n "$IN_PREV_REF" ]; then
+          if git show "$IN_PREV_REF:$IN_LOCK" > "$tmpd/previous.lock.json" 2>/dev/null; then
+            args+=(--previous-lock "$tmpd/previous.lock.json")
+          else
+            echo "::notice title=mcpdrift::no previous lock at $IN_PREV_REF (first lock?)"
+          fi
+        fi
         while IFS= read -r pat; do
           pat="${pat#"${pat%%[![:space:]]*}"}"; pat="${pat%"${pat##*[![:space:]]}"}"
           [ -n "$pat" ] && args+=(--ignore "$pat")

@@ -22,9 +22,21 @@
 - The diff walk is iterative, and paths are tuples internally, so tool names containing dots stay unambiguous.
 - Writes are atomic. Piping output into `head` no longer prints a traceback, and fails closed.
 
+### Hardening (panel review)
+- GitHub output can't be hijacked. The text block is wrapped in `::stop-commands::<random token>`, annotation text is percent-escaped, server stderr has `::` defused, and control characters in names are flagged.
+- `--ignore` globs match per path segment (`*` no longer crosses dots; `**` crosses any depth; `\.` is a literal dot), so a pattern can't hide a new tool whose name contains a dot.
+- Signed payload v3 includes a monotonic `seq` and `snapshot_at`. `check --previous-lock`, and the Action's `previous-lock-ref`, reject rollback. The Action can read signers from a protected ref (`allowed-signers-ref`) or a secret (`allowed-signers-content`).
+- 64 MiB total cap per server and per listing file.
+- Every string value is scanned (`default`, `enum`, `const`, `examples`, unknown fields), not just descriptions. Text over the cap is `high`, and its head and tail are both scanned.
+- New signals: whole words in Latin look-alike scripts, base64 blobs that decode to text (scanned recursively), HTML comments, split or leetspeak instruction evasions, and control characters.
+- Fewer false positives: "pass your API key in … see https://docs" and "you must first call …" no longer alert, and URLs are allowed in `uri` fields.
+- File modes are preserved (new files get 0644 minus umask). Markdown titles are escaped, and URLs, emails and mentions are not auto-linked.
+- Windows: stdout and stderr use `errors=backslashreplace`, and commands resolve via `shutil.which` (`npx` → `npx.cmd`).
+
 ### Compatibility
+- **`check --fail-on` now defaults to `low`**: an `info`-only change, such as a bare server version bump, no longer fails. Use `--fail-on info` for 0.1's any-drift behaviour.
+- **Ignore globs that relied on `*` crossing dots** (e.g. `tools.*.description` meaning any depth) must now use `**`.
 - `check --json` keeps the exact 0.1 output shape. The richer output is `--format json`.
-- The default `--fail-on` is `info`, so any drift still fails, as in 0.1.
 - 0.1 lockfiles (without `digests`) are still read.
 - Duplicate tool, prompt or resource names are now kept as `name#dup2` instead of the last one silently winning. On a server with duplicates, this shows as drift against a 0.1 lock.
 

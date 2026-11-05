@@ -28,8 +28,14 @@ _STRONG_KINDS = {
     "contains zero-width / invisible characters",
     "mixed-script look-alike word(s)",
     "contains unusual Unicode variation selectors (can hide data)",
+    "look-alike word(s) in a non-Latin script",
+    "contains an HTML comment (hidden from rendered views, read by the model)",
+    "base64-encoded text",
+    "contains control characters (can forge log or CI output)",
 }
 _NAME_KINDS = {
+    "contains control characters (can forge log or CI output)",
+    "look-alike word(s) in a non-Latin script",
     "contains invisible Unicode tag characters (can smuggle hidden instructions)",
     "contains bidirectional control characters (text can display differently than it reads)",
     "contains zero-width / invisible characters",
@@ -41,8 +47,11 @@ _NAME_KINDS = {
 def name_signals(name: str) -> List[Tuple[str, str]]:
     """Look-alike / invisible-character checks for a tool or prompt *name*
     (a name like ``read_f\u0456le`` can shadow ``read_file``)."""
-    return [(s, "name " + r) for s, r in text_signals(name.replace("_", " ").replace("-", " ") + " " + name)
-            if r.split(":")[0] in _NAME_KINDS]
+    out = [(s, "name " + r) for s, r in text_signals(name.replace("_", " ").replace("-", " ") + " " + name)
+           if r.split(":")[0] in _NAME_KINDS]
+    if any(c in name for c in "\r\n\t") and not any("control" in r for _, r in out):
+        out.append(("high", "name contains control characters (can forge log or CI output)"))
+    return out
 _RANK = {s: i for i, s in enumerate(SEVERITIES)}
 
 TEXT_KEYS = {"description", "title"}
@@ -87,7 +96,8 @@ class Assessed:
     def finish(self) -> "Assessed":
         """Several independent strong signals together are the signature of a
         poisoned description, not an accident: escalate to critical."""
-        strong = [r for r in self.reasons if r.split(":")[0] in _STRONG_KINDS]
+        strong = [r for r in self.reasons
+                  if r.replace("inside base64 - ", "").replace("argument ", "").split(":")[0] in _STRONG_KINDS]
         if len(strong) >= 2:
             self.bump("critical", f"{len(strong)} independent poisoning signals together", "security")
         return self
@@ -120,6 +130,7 @@ _ZWJ_IN_WORD = re.compile("[\\w]\u200d|\u200d[\\w]")
 _VS_RUN = re.compile("[\ufe00-\ufe0f\U000e0100-\U000e01ef]{2,}|[\ufe00-\ufe0d\U000e0100-\U000e01ef]")
 _STRIP = re.compile(_INVISIBLE.pattern[:-1] + "\u200d\ufe00-\ufe0f\U000e0100-\U000e01ef]")
 _BIDI = re.compile("[‪-‮⁦-⁩]")
+_CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _TAGS_BLOCK = re.compile("[\U000e0000-\U000e007f]")
 
 _INSTRUCTION = re.compile(
@@ -134,7 +145,6 @@ _INSTRUCTION = re.compile(
 # Weaker phrasing that legitimate docs also use; worth a look, not an alarm.
 _INSTRUCTION_WEAK = re.compile(
     r"\b(before|prior\s+to)\s+(using|calling|invoking)\s+(this|any|the)\s+tool"
-    r"|\byou\s+(must|should)\s+(first|always)\b"
     r"|\bthis\s+is\s+(very\s+|extremely\s+)?important\b",
     re.IGNORECASE,
 )
@@ -157,11 +167,23 @@ _SENSITIVE_WORD = re.compile(
 )
 
 _EXFIL = re.compile(
+    # verb ... to/into/via <external destination>
     r"\b(send|post|upload|forward|transmit|exfiltrate|leak|copy|include|pass|append|attach|embed)\b"
-    r"[^.\n]{0,80}\b(to|into|in|as|via)\b[^.\n]{0,60}"
-    r"(https?://|\bwebhook\b|\bsidenote\b|\bexternal\s+(server|endpoint|url)\b|[\w.+-]+@[\w-]+\.[\w.]+)",
+    r"[^.\n]{0,80}\b(to|into|via)\b\s+(the\s+|an?\s+|this\s+)?"
+    r"(https?://|webhook\b|external\s+(server|endpoint|url)\b|[\w.+-]+@[\w-]+\.[a-z]{2,})"
+    # ... or smuggled through a side-channel argument
+    r"|\b(send|pass|include|put|append|attach|embed|copy)\b[^.\n]{0,80}\b(as|in|into)\b[^.\n]{0,30}\bsidenote\b",
     re.IGNORECASE,
 )
+_HTML_COMMENT = re.compile(r"<!--")
+_BASE64 = re.compile(r"(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{40,}={0,2}(?![A-Za-z0-9+/=])")
+_LEET = str.maketrans({"0": "o", "1": "i", "3": "e", "4": "a", "5": "s", "7": "t", "@": "a", "$": "s", "!": "i"})
+# single letters split by separators: I-M-P-O-R-T-A-N-T, i.g.n.o.r.e
+_SPLIT_LETTERS = re.compile(r"\b(?:\w[\s\-_.*|/]){3,}\w\b")
+# Cyrillic/Greek letters that look like Latin ones.
+_CONFUSABLE = set("аеорсухіјѕһԁԛԝвкмнтАВЕКМНОРСТХІЈЅԜοαιντυκρΑΒΕΖΗΙΚΜΝΟΡΤΥΧ")
+URL_KEYS = {"uri", "uriTemplate", "$schema", "$id", "$ref", "url", "href", "icons", "src"}
+STRUCTURAL_KEYS = {"type", "$schema", "$id", "$ref", "format", "mimeType"}
 
 _URL = re.compile(r"\b(?:https?|ftp|wss?)://[^\s'\"<>)]{1,300}", re.IGNORECASE)
 
@@ -200,18 +222,63 @@ def _mixed_script_words(text: str) -> List[str]:
     return out
 
 
+def _confusable_words(text: str) -> List[str]:
+    """Words written entirely in Cyrillic/Greek look-alikes inside Latin text
+    (e.g. "\u0440\u0430\u0443" for "pay")."""
+    if sum(c.isascii() and c.isalpha() for c in text) < 3:
+        return []  # genuinely non-Latin text
+    out = []
+    for word in re.findall(r"\w{2,}", text):
+        if all(c in _CONFUSABLE for c in word):
+            out.append(word)
+            if len(out) >= 3:
+                break
+    return out
+
+
+def _deobfuscate(norm: str) -> str:
+    def join(m: "re.Match[str]") -> str:
+        return re.sub(r"[\s\-_.*|/]", "", m.group(0))
+    return _SPLIT_LETTERS.sub(join, norm).lower().translate(_LEET)
+
+
+def _b64_text(blob: str) -> Optional[str]:
+    import base64
+    import binascii
+    try:
+        raw = base64.b64decode(blob + "=" * (-len(blob) % 4), validate=False)
+    except (binascii.Error, ValueError):
+        return None
+    try:
+        dec = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    printable = sum(c.isprintable() or c in "\n\t" for c in dec)
+    return dec if dec and printable / len(dec) > 0.95 else None
+
+
 def _normalize(text: str) -> str:
     # NFKC folds compatibility look-alikes (fullwidth, ligatures); stripping
     # invisibles defeats "<IMP​ORTANT>"-style splitting.
     return _STRIP.sub("", unicodedata.normalize("NFKC", text))
 
 
-def text_signals(text: str, other_names: Sequence[str] = ()) -> List[Tuple[str, str]]:
-    """Return (severity, reason) pairs for risky content in ``text``."""
+def text_signals(text: str, other_names: Sequence[str] = (), allow_urls: bool = False,
+                 _depth: int = 0) -> List[Tuple[str, str]]:
+    """Return (severity, reason) pairs for risky content in ``text``.
+
+    Text longer than ``MAX_TEXT`` is itself flagged and its head and tail are
+    scanned, so padding cannot push a payload out of view.
+    """
     if not isinstance(text, str) or not text:
         return []
-    text = text[:MAX_TEXT]
     out: List[Tuple[str, str]] = []
+    if len(text) > MAX_TEXT:
+        out.append(("high", f"text is {len(text)} characters (over {MAX_TEXT}); only head and tail were scanned"))
+        half = MAX_TEXT // 2
+        text = text[:half] + "\n" + text[-half:]
+    if _CONTROL.search(text):
+        out.append(("high", "contains control characters (can forge log or CI output)"))
     if _TAGS_BLOCK.search(text):
         out.append(("critical", "contains invisible Unicode tag characters (can smuggle hidden instructions)"))
     elif _BIDI.search(text):
@@ -223,10 +290,31 @@ def text_signals(text: str, other_names: Sequence[str] = ()) -> List[Tuple[str, 
     mixed = _mixed_script_words(text)
     if mixed:
         out.append(("high", "mixed-script look-alike word(s): " + ", ".join(repr(w) for w in mixed[:3])))
+    conf = _confusable_words(text)
+    if conf:
+        out.append(("high", "look-alike word(s) in a non-Latin script: " + ", ".join(repr(w) for w in conf)))
     norm = _normalize(text)
     m = _INSTRUCTION.search(norm)
     if m:
         out.append(("high", f"instruction aimed at the model: {m.group(0)[:60]!r}"))
+    else:
+        m = _INSTRUCTION.search(_deobfuscate(norm))
+        if m:
+            out.append(("high", f"instruction aimed at the model: obfuscated {m.group(0)[:60]!r}"))
+    if _HTML_COMMENT.search(norm):
+        out.append(("high", "contains an HTML comment (hidden from rendered views, read by the model)"))
+    for blob in _BASE64.findall(norm)[:5]:
+        if not (re.search(r"[a-z]", blob) and re.search(r"[A-Z]", blob) and re.search(r"[0-9+/]", blob)):
+            continue
+        dec = _b64_text(blob)
+        if dec is not None:
+            out.append(("high", f"base64-encoded text: {dec[:40]!r}"))
+            if _depth == 0:
+                for sev, reason in text_signals(dec, other_names, allow_urls, _depth=1):
+                    out.append((sev, "inside base64 - " + reason))
+        else:
+            out.append(("medium", "long encoded-looking blob (base64?)"))
+        break
     m = _INSTRUCTION_WEAK.search(norm)
     if m:
         out.append(("medium", f"imperative aimed at the model: {m.group(0)[:60]!r}"))
@@ -239,7 +327,7 @@ def text_signals(text: str, other_names: Sequence[str] = ()) -> List[Tuple[str, 
     m = _EXFIL.search(norm)
     if m:
         out.append(("high", f"exfiltration-style wording: {m.group(0)[:60]!r}"))
-    urls = _URL.findall(norm)
+    urls = [] if allow_urls else _URL.findall(norm)
     if urls:
         out.append(("medium", "contains URL(s): " + ", ".join(u[:60] for u in urls[:3])))
     low = norm.lower()
@@ -250,14 +338,14 @@ def text_signals(text: str, other_names: Sequence[str] = ()) -> List[Tuple[str, 
     return out
 
 
-def _new_signals(old_text: Any, new_text: Any, names: Sequence[str]) -> List[Tuple[str, str]]:
-    old = {r for _, r in text_signals(old_text, names)} if isinstance(old_text, str) else set()
+def _new_signals(old_text: Any, new_text: Any, names: Sequence[str], allow_urls: bool = False) -> List[Tuple[str, str]]:
+    old = {r for _, r in text_signals(old_text, names, allow_urls)} if isinstance(old_text, str) else set()
     # Compare on the signal *kind* (text before ':') so a URL that merely
     # changes is still new, but the same category of phrase that was already
     # there does not re-alert.
     old_kinds = {r.split(":")[0] for r in old}
     out = []
-    for sev, reason in text_signals(new_text, names):
+    for sev, reason in text_signals(new_text, names, allow_urls):
         if reason in old:
             continue
         if reason.split(":")[0] in old_kinds and sev != "critical":
@@ -272,20 +360,36 @@ def _new_signals(old_text: Any, new_text: Any, names: Sequence[str]) -> List[Tup
 
 
 def iter_texts(node: Any, parts: Tuple[str, ...] = ()) -> Iterable[Tuple[Tuple[str, ...], str]]:
-    """Yield (path, text) for every description/title string under ``node``."""
+    """Yield (path, text) for every string value under ``node`` that the
+    model may read: descriptions and titles, but also defaults, enums,
+    consts, examples and unknown fields. Purely structural keys are skipped."""
+    if isinstance(node, str):
+        yield parts, node
+        return
     stack = [(node, parts)]
     while stack:
         cur, p = stack.pop()
         if isinstance(cur, dict):
             for k, v in cur.items():
-                if k in TEXT_KEYS and isinstance(v, str):
-                    yield p + (k,), v
+                if isinstance(v, str):
+                    if k not in STRUCTURAL_KEYS:
+                        yield p + (str(k),), v
                 elif isinstance(v, (dict, list)):
                     stack.append((v, p + (str(k),)))
         elif isinstance(cur, list):
             for i, v in enumerate(cur):
-                if isinstance(v, (dict, list)):
+                if isinstance(v, str):
+                    yield p + (str(i),), v
+                elif isinstance(v, (dict, list)):
                     stack.append((v, p + (str(i),)))
+
+
+def _url_ok(parts: Tuple[str, ...]) -> bool:
+    return any(x in URL_KEYS for x in parts[-2:])
+
+
+def _signals_at(parts: Tuple[str, ...], text: str, names: Sequence[str]) -> List[Tuple[str, str]]:
+    return text_signals(text, names, allow_urls=_url_ok(parts))
 
 
 def iter_property_names(schema: Any, parts: Tuple[str, ...] = ()) -> Iterable[Tuple[Tuple[str, ...], str]]:
@@ -349,8 +453,8 @@ def _assess_entry_added(a: Assessed, entry: Any, names: Sequence[str]) -> None:
         ann = entry.get("annotations")
         if isinstance(ann, dict) and ann.get("destructiveHint") is True and ann.get("readOnlyHint") is not True:
             a.bump("high", "new tool declares destructiveHint=true", "security")
-        for _, text in iter_texts(entry):
-            for sev, reason in text_signals(text, others):
+        for tp, text in iter_texts(entry, a.parts):
+            for sev, reason in _signals_at(tp, text, others):
                 a.bump(sev, reason, "security")
         for _, pname in iter_property_names(entry.get("inputSchema")):
             if _SENSITIVE_NAME.search(pname):
@@ -390,9 +494,6 @@ def _assess_schema(a: Assessed, old_s: Dict[str, Any], new_s: Dict[str, Any]) ->
                 a.bump("low", f"new optional {'output field' if is_output else 'argument'} {last!r}", "widened")
             if _SENSITIVE_NAME.search(last) and not is_output:
                 a.bump("high", f"new argument has a sensitive-looking name: {last!r}", "security")
-            for _, text in iter_texts(a.new):
-                for sev, reason in text_signals(text):
-                    a.bump(sev, reason, "security")
         else:
             a.bump("medium", f"{'output field' if is_output else 'argument'} {last!r} removed", "breaking")
         return
@@ -469,6 +570,20 @@ def _assess_annotations(a: Assessed) -> bool:
     return True
 
 
+def _scan_new_strings(a: Assessed, o: Any, n: Any, others: Sequence[str]) -> None:
+    """Every string the change introduces (defaults, enums, consts, examples,
+    nested descriptions, unknown fields) gets the same text checks."""
+    before = set(t for _, t in iter_texts(o)) if not is_missing(o) else set()
+    for tp, text in iter_texts(n, a.parts):
+        if text in before:
+            continue
+        for sev, reason in _signals_at(tp, text, others):
+            a.bump(sev, reason, "security")
+    if a.kind == "added" and len(a.parts) >= 2 and a.parts[-2] == "properties":
+        for sev, reason in name_signals(a.parts[-1]):
+            a.bump(sev, "argument " + reason, "security")
+
+
 def assess_changes(
     raw: Sequence[RawChange], old: Dict[str, Any], new: Dict[str, Any]
 ) -> List[Assessed]:
@@ -504,7 +619,7 @@ def assess_changes(
                 a.bump("medium", f"{section[:-1]} replaced")
         elif section in SECTIONS and parts[-1] in TEXT_KEYS and isinstance(n if not is_missing(n) else None, str):
             a.bump("low", f"{parts[-1]} text changed (the model reads this verbatim)", "text")
-            for sev, reason in _new_signals(None if is_missing(o) else o, n, others):
+            for sev, reason in _new_signals(None if is_missing(o) else o, n, others, _url_ok(parts)):
                 a.bump(sev, reason, "security")
             if isinstance(o, str) and len(n) > 2 * len(o) + 200:
                 a.bump("medium", f"text grew from {len(o)} to {len(n)} characters")
@@ -512,18 +627,13 @@ def assess_changes(
             pass
         elif section in SECTIONS and _schema_context(parts) is not None:
             _assess_schema(a, old, new)
-            # text nested inside a newly added schema node
-            if kind == "added" and isinstance(n, dict):
-                for _, text in iter_texts(n):
-                    for sev, reason in text_signals(text, others):
-                        a.bump(sev, reason, "security")
         elif section in SECTIONS:
             a.bump("low", "metadata changed")
-            for _, text in iter_texts(n if isinstance(n, dict) else {}):
-                for sev, reason in text_signals(text, others):
-                    a.bump(sev, reason, "security")
         else:
             a.bump("low", "surface changed")
+        if section in SECTIONS and (len(parts) > 2 or kind == "changed") and kind != "removed" and not (
+                parts[-1] in TEXT_KEYS and isinstance(n, str)):
+            _scan_new_strings(a, o, n, others)
         out.append(a.finish())
     return out
 
@@ -548,7 +658,7 @@ def scan_surface(surface: Dict[str, Any]) -> List[Assessed]:
                     a.bump(sev, reason, "security")
                 out.append(a.finish())
             for parts, text in sorted(iter_texts(entry, (section, name))):
-                sigs = text_signals(text, others)
+                sigs = _signals_at(parts, text, others)
                 if sigs:
                     a = Assessed("present", join_path(parts), parts, brief(text), "info", new=text)
                     for sev, reason in sigs:
@@ -556,8 +666,12 @@ def scan_surface(surface: Dict[str, Any]) -> List[Assessed]:
                     out.append(a.finish())
             if isinstance(entry, dict):
                 for parts, pname in sorted(iter_property_names(entry.get("inputSchema"), (section, name, "inputSchema"))):
-                    if _SENSITIVE_NAME.search(pname):
+                    nsig = name_signals(pname)
+                    if _SENSITIVE_NAME.search(pname) or nsig:
                         a = Assessed("present", join_path(parts), parts, repr(pname), "info", new=pname)
-                        a.bump("medium", f"argument has a sensitive-looking name: {pname!r}", "security")
-                        out.append(a)
+                        if _SENSITIVE_NAME.search(pname):
+                            a.bump("medium", f"argument has a sensitive-looking name: {pname!r}", "security")
+                        for sev, reason in nsig:
+                            a.bump(sev, "argument " + reason, "security")
+                        out.append(a.finish())
     return out

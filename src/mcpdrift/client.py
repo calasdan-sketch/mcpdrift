@@ -9,6 +9,7 @@ import collections
 import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -23,9 +24,17 @@ PROTOCOL_VERSION = "2024-11-05"
 
 # Hard limits so a hostile or broken server cannot exhaust memory or loop.
 MAX_LINE_BYTES = 16 * 1024 * 1024
+MAX_TOTAL_BYTES = 64 * 1024 * 1024  # across all pages of all listings
 MAX_PAGES = 1000
 MAX_ITEMS = 50_000
 STDERR_TAIL = 20
+
+
+def _sanitize(line: str) -> str:
+    """Server stderr is untrusted: drop control characters and defuse
+    "::" so it cannot forge GitHub Actions workflow commands."""
+    line = "".join(c if c.isprintable() else "?" for c in line)
+    return line.replace("::", ": :")
 
 
 class MCPError(RuntimeError):
@@ -44,6 +53,11 @@ class StdioMCP:
             raise MCPError("server command is empty")
         merged = dict(os.environ)
         merged.update(env or {})
+        # Resolve through PATH (and PATHEXT on Windows) so "npx" finds
+        # npx.cmd; subprocess without a shell would not.
+        resolved = shutil.which(command[0], path=merged.get("PATH"))
+        if resolved:
+            command = [resolved] + list(command[1:])
         try:
             self.proc = subprocess.Popen(  # noqa: S603 - user's own config
                 command,
@@ -66,12 +80,17 @@ class StdioMCP:
 
     def _pump(self) -> None:
         assert self.proc.stdout is not None
+        total = 0
         while True:
             raw = self.proc.stdout.readline(MAX_LINE_BYTES + 1)
             if not raw:
                 break
+            total += len(raw)
             if len(raw) > MAX_LINE_BYTES:
                 self._lines.put("\x00too-long")
+                break
+            if total > MAX_TOTAL_BYTES:
+                self._lines.put("\x00too-much")
                 break
             self._lines.put(raw.decode("utf-8", "replace"))
         self._lines.put("")  # EOF sentinel
@@ -81,7 +100,7 @@ class StdioMCP:
         # the tail is shown when something fails.
         assert self.proc.stderr is not None
         for raw in iter(lambda: self.proc.stderr.readline(65536), b""):
-            self._stderr.append(raw.decode("utf-8", "replace").rstrip())
+            self._stderr.append(_sanitize(raw.decode("utf-8", "replace").rstrip())[:500])
 
     def stderr_tail(self) -> str:
         lines = [x for x in list(self._stderr) if x]
@@ -112,6 +131,8 @@ class StdioMCP:
                 raise MCPError("server closed stdout" + self.stderr_tail())
             if line == "\x00too-long":
                 raise MCPError(f"server sent a message larger than {MAX_LINE_BYTES} bytes")
+            if line == "\x00too-much":
+                raise MCPError(f"server sent more than {MAX_TOTAL_BYTES} bytes in total; refusing to continue")
             try:
                 data = json.loads(line)
             except (json.JSONDecodeError, RecursionError):
@@ -240,7 +261,9 @@ def surface_from_file(path: str) -> Dict[str, Any]:
     server's listing in CI.
     """
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        if os.path.getsize(path) > MAX_TOTAL_BYTES:
+            raise MCPError(f"listing file is larger than {MAX_TOTAL_BYTES} bytes")
+        with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except FileNotFoundError:
         raise MCPError(f"listing file not found: {path}") from None
