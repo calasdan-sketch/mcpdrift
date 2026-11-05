@@ -6,3 +6,4 @@ dist/
 *.whl
 *.tar.gz
 .pytest_cache/
+.venv/
