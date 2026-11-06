@@ -1,0 +1,132 @@
+name: mcpdrift
+description: Fail the build when an MCP server's tools, descriptions or schemas drift from the committed lockfile, with severity-scored, readable findings.
+author: calasdan-sketch
+branding:
+  icon: lock
+  color: orange
+
+inputs:
+  lock:
+    description: Path to the committed lockfile (from `mcpdrift snapshot`).
+    required: true
+  config:
+    description: MCP config (.mcp.json style) used to launch the server. Give this or `from-file`.
+    required: false
+    default: ""
+  from-file:
+    description: Saved tools/list JSON to check instead of launching a server (nothing is executed).
+    required: false
+    default: ""
+  server:
+    description: Server name inside the config (defaults to the one recorded in the lock).
+    required: false
+    default: ""
+  fail-on:
+    description: Lowest severity that fails the job (info, low, medium, high, critical, never). Version-only bumps are info.
+    required: false
+    default: low
+  ignore:
+    description: Newline-separated glob patterns of paths to ignore (e.g. server.version).
+    required: false
+    default: ""
+  allowed-signers:
+    description: >-
+      Path of an OpenSSH allowed_signers file. When set, <lock>.sig must verify. Read from
+      `allowed-signers-ref` when that is set, so a pull request cannot add its own key.
+    required: false
+    default: ""
+  allowed-signers-ref:
+    description: >-
+      Git ref to read `allowed-signers` from (e.g. origin/main). Use your protected base branch.
+      Needs the ref fetched (actions/checkout with fetch-depth 0).
+    required: false
+    default: ""
+  allowed-signers-content:
+    description: allowed_signers file content, e.g. from a repository secret. Overrides `allowed-signers`.
+    required: false
+    default: ""
+  previous-lock-ref:
+    description: >-
+      Git ref holding the previous lock (e.g. origin/main). The check fails (exit 3) when the lock's
+      seq goes backwards, which stops replay of an older, validly signed lock.
+    required: false
+    default: ""
+  identity:
+    description: Signer identity required with allowed-signers (e.g. you@example.com).
+    required: false
+    default: ""
+  timeout:
+    description: Seconds per MCP request.
+    required: false
+    default: "20"
+  python-version:
+    description: Python used to run mcpdrift.
+    required: false
+    default: "3.12"
+
+outputs:
+  exit-code:
+    description: 0 no drift (or below fail-on), 1 drift, 2 usage/server error, 3 integrity/signature failure.
+    value: ${{ steps.check.outputs.exit-code }}
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python-version }}
+    - name: Install mcpdrift (from this action's own pinned source, not a floating PyPI version)
+      shell: bash
+      run: python -m pip install --disable-pip-version-check -q "$GITHUB_ACTION_PATH"
+    - name: Check MCP surface
+      id: check
+      shell: bash
+      env:
+        IN_LOCK: ${{ inputs.lock }}
+        IN_CONFIG: ${{ inputs.config }}
+        IN_FROM_FILE: ${{ inputs.from-file }}
+        IN_SERVER: ${{ inputs.server }}
+        IN_FAIL_ON: ${{ inputs.fail-on }}
+        IN_IGNORE: ${{ inputs.ignore }}
+        IN_SIGNERS: ${{ inputs.allowed-signers }}
+        IN_SIGNERS_REF: ${{ inputs.allowed-signers-ref }}
+        IN_SIGNERS_CONTENT: ${{ inputs.allowed-signers-content }}
+        IN_PREV_REF: ${{ inputs.previous-lock-ref }}
+        IN_IDENTITY: ${{ inputs.identity }}
+        IN_TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        # Inputs arrive via env vars, never interpolated into the script,
+        # so a crafted input cannot inject shell commands.
+        args=(check --lock "$IN_LOCK" --fail-on "$IN_FAIL_ON" --timeout "$IN_TIMEOUT"
+              --format github --markdown-out "$GITHUB_STEP_SUMMARY")
+        [ -n "$IN_CONFIG" ] && args+=(--config "$IN_CONFIG")
+        [ -n "$IN_FROM_FILE" ] && args+=(--from-file "$IN_FROM_FILE")
+        [ -n "$IN_SERVER" ] && args+=(--server "$IN_SERVER")
+        tmpd="$(mktemp -d)"
+        if [ -n "$IN_SIGNERS_CONTENT" ]; then
+          printf '%s\n' "$IN_SIGNERS_CONTENT" > "$tmpd/allowed_signers"
+          args+=(--allowed-signers "$tmpd/allowed_signers" --identity "$IN_IDENTITY")
+        elif [ -n "$IN_SIGNERS" ] && [ -n "$IN_SIGNERS_REF" ]; then
+          git show "$IN_SIGNERS_REF:$IN_SIGNERS" > "$tmpd/allowed_signers"
+          args+=(--allowed-signers "$tmpd/allowed_signers" --identity "$IN_IDENTITY")
+        elif [ -n "$IN_SIGNERS" ]; then
+          echo "::warning title=mcpdrift::allowed-signers is read from the PR's own checkout; set allowed-signers-ref or allowed-signers-content so a PR cannot add its own key"
+          args+=(--allowed-signers "$IN_SIGNERS" --identity "$IN_IDENTITY")
+        fi
+        if [ -n "$IN_PREV_REF" ]; then
+          if git show "$IN_PREV_REF:$IN_LOCK" > "$tmpd/previous.lock.json" 2>/dev/null; then
+            args+=(--previous-lock "$tmpd/previous.lock.json")
+          else
+            echo "::notice title=mcpdrift::no previous lock at $IN_PREV_REF (first lock?)"
+          fi
+        fi
+        while IFS= read -r pat; do
+          pat="${pat#"${pat%%[![:space:]]*}"}"; pat="${pat%"${pat##*[![:space:]]}"}"
+          [ -n "$pat" ] && args+=(--ignore "$pat")
+        done <<< "$IN_IGNORE"
+        set +e
+        mcpdrift "${args[@]}"
+        code=$?
+        set -e
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        exit $code
