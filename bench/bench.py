@@ -78,7 +78,7 @@ def attacks():
     def destructive(t):
         t["annotations"] = {"destructiveHint": True}
     def invisible(t):
-        t["description"] = t["description"].replace("here", "he​re")
+        t["description"] = t["description"].replace("here", "he\u200bre")
     def anyof(t):
         t["inputSchema"]["properties"]["any"]["anyOf"].pop()
     def newprop(t):

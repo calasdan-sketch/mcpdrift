@@ -20,11 +20,11 @@ attacker replaying an older, validly signed lock (see ``check
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import tempfile
 from typing import Any, Dict
 
+from ._exe import find_exe
 from .canon import sha256_of
 
 NAMESPACE = "mcpdrift"
@@ -56,7 +56,7 @@ def signing_payload(lock: Dict[str, Any]) -> bytes:
 
 
 def _ssh_keygen() -> str:
-    exe = shutil.which("ssh-keygen")
+    exe = find_exe("ssh-keygen")
     if not exe:
         raise SignError("ssh-keygen not found (install OpenSSH 8.1+ to sign or verify lockfiles)")
     return exe

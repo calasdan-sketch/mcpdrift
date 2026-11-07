@@ -7,6 +7,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
@@ -24,6 +25,7 @@ USAGE_EXIT = 2
 INTEGRITY_EXIT = 3
 LOCKFILE_VERSION = 2
 MAX_HISTORY = 50
+DEFAULT_LOCK = "mcp.lock.json"
 
 
 def load_servers(config_path: str) -> Dict[str, Dict[str, Any]]:
@@ -32,37 +34,42 @@ def load_servers(config_path: str) -> Dict[str, Dict[str, Any]]:
         with open(config_path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except FileNotFoundError:
-        raise SystemExit(f"mcpdrift: config not found: {config_path}")
-    except (json.JSONDecodeError, UnicodeDecodeError) as e:
-        raise SystemExit(f"mcpdrift: config is not valid JSON: {e}")
+        raise _Exit(USAGE_EXIT, f"mcpdrift: config not found: {config_path}")
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as e:
+        raise _Exit(USAGE_EXIT, f"mcpdrift: config is not valid JSON: {e}")
     if not isinstance(data, dict):
-        raise SystemExit("mcpdrift: config must be a JSON object")
+        raise _Exit(USAGE_EXIT, "mcpdrift: config must be a JSON object")
     servers = data.get("mcpServers") or data.get("servers") or data
     if not isinstance(servers, dict) or not servers:
-        raise SystemExit("mcpdrift: no servers found in config")
-    return {k: v for k, v in servers.items() if isinstance(v, dict)}
+        raise _Exit(USAGE_EXIT, "mcpdrift: no servers found in config")
+    found = {k: v for k, v in servers.items() if isinstance(v, dict)}
+    if not found:
+        raise _Exit(USAGE_EXIT, "mcpdrift: no servers found in config")
+    return found
 
 
-def pick_server(servers: Dict[str, Dict[str, Any]], name: str | None) -> Dict[str, Any]:
+def pick_server(servers: Dict[str, Dict[str, Any]], name: str | None, soft: bool = False) -> Dict[str, Any]:
+    """``soft``: ``name`` came from a lockfile, not from the user; a config with
+    exactly one server is then used even if it was renamed."""
     if name is None:
         if len(servers) == 1:
             return next(iter(servers.values()))
-        raise SystemExit(
-            "mcpdrift: config has several servers, name one with --server: "
-            + ", ".join(sorted(servers))
-        )
+        raise _Exit(USAGE_EXIT, "mcpdrift: config has several servers, name one with --server: "
+                    + ", ".join(sorted(servers)))
     if name not in servers:
-        raise SystemExit(f"mcpdrift: server {name!r} not in config (have: {', '.join(sorted(servers))})")
+        if soft and len(servers) == 1:
+            return next(iter(servers.values()))
+        raise _Exit(USAGE_EXIT, f"mcpdrift: server {name!r} not in config (have: {', '.join(sorted(servers))})")
     return servers[name]
 
 
-def _capture(args: argparse.Namespace, server_name: Optional[str]) -> Capture:
+def _capture(args: argparse.Namespace, server_name: Optional[str], soft: bool = False) -> Capture:
     if getattr(args, "from_file", None):
         surf = surface_from_file(args.from_file)
         return Capture(surf, [surf])
     if not args.config:
-        raise SystemExit("mcpdrift: give --config (launch the server) or --from-file (saved listing)")
-    server = pick_server(load_servers(args.config), server_name)
+        raise _Exit(USAGE_EXIT, "mcpdrift: give --config (launch the server) or --from-file (saved listing)")
+    server = pick_server(load_servers(args.config), server_name, soft and not args.server)
     allow_env: List[str] = []
     for item in args.allow_env or []:
         allow_env += [x.strip() for x in item.split(",") if x.strip()]
@@ -71,8 +78,8 @@ def _capture(args: argparse.Namespace, server_name: Optional[str]) -> Capture:
                          isolate_env=getattr(args, "isolate_env", False))
 
 
-def _live_surface(args: argparse.Namespace, server_name: Optional[str]) -> Dict[str, Any]:
-    return _capture(args, server_name).surface
+def _live_surface(args: argparse.Namespace, server_name: Optional[str], soft: bool = False) -> Dict[str, Any]:
+    return _capture(args, server_name, soft).surface
 
 
 def _server_label(args: argparse.Namespace) -> str:
@@ -94,10 +101,30 @@ def _target_mode(path: str) -> int:
         return 0o644 & ~umask
 
 
+def _replace(tmp: str, path: str) -> None:
+    """``os.replace`` with a short retry: on Windows it fails with
+    PermissionError while another process (an editor, a virus scanner) holds
+    the destination open for a moment."""
+    attempts = 6 if os.name == "nt" else 1
+    for i in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if i == attempts - 1:
+                raise
+            time.sleep(0.05 * (i + 1))
+
+
 def _atomic_write(path: str, text: str) -> None:
     d = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(d):
+        raise _Exit(USAGE_EXIT, f"mcpdrift: cannot write {path}: the folder {d} does not exist")
     mode = _target_mode(path)
-    fd, tmp = tempfile.mkstemp(prefix=".mcpdrift-", dir=d)
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=".mcpdrift-", dir=d)
+    except OSError as e:
+        raise _Exit(USAGE_EXIT, f"mcpdrift: cannot write {path}: {e.strerror or e}") from e
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(text)
@@ -105,12 +132,14 @@ def _atomic_write(path: str, text: str) -> None:
             os.chmod(tmp, mode)
         except OSError:
             pass
-        os.replace(tmp, path)
-    except BaseException:
+        _replace(tmp, path)
+    except BaseException as e:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+        if isinstance(e, OSError):
+            raise _Exit(USAGE_EXIT, f"mcpdrift: cannot write {path}: {e.strerror or e}") from e
         raise
 
 
@@ -124,6 +153,11 @@ def _read_lock(path: str) -> Dict[str, Any]:
         raise _Exit(USAGE_EXIT, f"mcpdrift: lock is not valid JSON: {e}")
     if not isinstance(lock, dict) or not isinstance(lock.get("surface", {}), dict):
         raise _Exit(USAGE_EXIT, "mcpdrift: lock has no surface object")
+    ver = lock.get("lockfile_version", 1)
+    if not isinstance(ver, int) or isinstance(ver, bool) or ver > LOCKFILE_VERSION:
+        raise _Exit(USAGE_EXIT, f"mcpdrift: {path} has lockfile_version {str(ver)[:20]!r}, newer than this "
+                                f"mcpdrift understands ({LOCKFILE_VERSION}). Upgrade mcpdrift (pip install -U mcpdrift); "
+                                "comparing it anyway could hide a change.")
     return lock
 
 
@@ -180,9 +214,19 @@ def _read_text(path: str) -> str:
         return ""
 
 
+def _use_color() -> bool:
+    """Colour only on a real terminal. A legacy Windows console prints raw
+    escape codes, so there it needs a terminal known to understand them."""
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        return False
+    if os.name == "nt":
+        return any(os.environ.get(k) for k in ("WT_SESSION", "ANSICON", "ConEmuANSI", "TERM_PROGRAM", "COLORTERM"))
+    return True
+
+
 def _emit(items: List[Assessed], fmt: str, lock_path: str = "", extra: Optional[Dict[str, Any]] = None,
           scan: bool = False) -> None:
-    kw = _SCAN if scan else {}
+    kw: Dict[str, Any] = _SCAN if scan else {}
     if fmt == "sarif":
         sys.stdout.write(render_sarif(items, lock_path, _read_text(lock_path) if lock_path else "", __version__))
     elif fmt == "json":
@@ -193,7 +237,7 @@ def _emit(items: List[Assessed], fmt: str, lock_path: str = "", extra: Optional[
         sys.stdout.write(render_github(items, lock_path))
         sys.stdout.write(stop_commands(render_text(items, **kw)))
     else:
-        color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+        color = _use_color()
         sys.stdout.write(render_text(items, color=color, **kw))
 
 
@@ -320,7 +364,7 @@ def _ignore_list(args: argparse.Namespace) -> List[str]:
 
 
 def _prepare(args: argparse.Namespace, lock: Dict[str, Any]) -> Tuple[Prepared, Capture]:
-    cap = _capture(args, args.server or lock.get("server") if not args.from_file else args.server)
+    cap = _capture(args, args.server or lock.get("server") if not args.from_file else args.server, soft=True)
     prep = prepare(lock.get("surface", {}), cap.samples, cap.notifications, _ignore_list(args), args.strict)
     if prep.cosmetic_ignored:
         print(f"mcpdrift: {prep.cosmetic_ignored} cosmetic-only difference(s) ignored (reordered lists, "
@@ -338,7 +382,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         _check_rollback(lock, args.previous_lock)
     if args.json:
         # Legacy 0.1 output shape, kept byte-compatible for existing scripts.
-        live = _live_surface(args, args.server or lock.get("server") if not args.from_file else args.server)
+        live = _live_surface(args, args.server or lock.get("server") if not args.from_file else args.server, True)
         findings = diff_surfaces(lock.get("surface", {}), live, ignore=_ignore_list(args))
         print(json.dumps({"drift": bool(findings), "findings": findings}, indent=2))
         return DRIFT_EXIT if findings else OK_EXIT
@@ -387,7 +431,7 @@ def cmd_update(args: argparse.Namespace) -> int:
             print(f"mcpdrift: not updated. Read the drift above, then re-run with --approve {prep.token}",
                   file=sys.stderr)
         return DRIFT_EXIT
-    history = lock.get("history") if isinstance(lock.get("history"), list) else []
+    history: List[Any] = lock["history"] if isinstance(lock.get("history"), list) else []
     entry = {
         "seq": _previous_seq(args.lock) + 1,
         "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
@@ -445,6 +489,39 @@ def cmd_diff(args: argparse.Namespace) -> int:
     _append_markdown(args.markdown_out, prep.items, f"mcpdrift diff: {new.get('server') or 'server'}")
     _write_sarif(args.sarif_out, prep.items, args.new)
     return _exit_for(prep.items, args.fail_on)
+
+
+def cmd_demo(args: argparse.Namespace) -> int:
+    """Run the 10-second example on listings that ship inside the package, so
+    it works after a plain ``pip install`` (nothing is launched or sent)."""
+    from importlib import resources
+
+    base = resources.files("mcpdrift") / "examples"
+    with tempfile.TemporaryDirectory(prefix="mcpdrift-demo-") as tmp:
+        work = args.dir or tmp
+        if args.dir:
+            os.makedirs(work, exist_ok=True)
+        paths = {}
+        for name in ("notes-v1.json", "notes-v2.json"):
+            paths[name] = os.path.join(work, name)
+            _atomic_write(paths[name], (base / name).read_text(encoding="utf-8"))
+        lock = os.path.join(work, "demo.lock.json")
+        steps = [
+            ["snapshot", "--from-file", paths["notes-v1.json"], "--out", lock],
+            ["check", "--from-file", paths["notes-v2.json"], "--lock", lock],
+        ]
+        print("mcpdrift demo: step 1, pin the surface of notes server v1 (a saved listing; nothing is run)",
+              file=sys.stderr)
+        rc = main(steps[0])
+        if rc != OK_EXIT:
+            return rc
+        print("\nmcpdrift demo: step 2, check a later release of the server against that pin", file=sys.stderr)
+        rc = main(steps[1])
+        print(f"\nmcpdrift demo: the check exited {rc} (1 means drift was found, which is what this example shows). "
+              "Your own server: mcpdrift snapshot --config .mcp.json --out mcp.lock.json", file=sys.stderr)
+        if args.dir:
+            print(f"mcpdrift demo: files kept in {work}", file=sys.stderr)
+    return OK_EXIT if rc == DRIFT_EXIT else USAGE_EXIT
 
 
 def cmd_sign(args: argparse.Namespace) -> int:
@@ -529,7 +606,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     c = sub.add_parser("check", help="diff the live surface against a lockfile; exit 1 on drift")
     _source_args(c)
-    c.add_argument("--lock", required=True, help="lockfile produced by `snapshot`")
+    c.add_argument("--lock", default=DEFAULT_LOCK, help=f"lockfile produced by `snapshot` (default {DEFAULT_LOCK})")
     c.add_argument("--ignore", action="append", help="glob pattern of paths to ignore (repeatable)")
     c.add_argument("--ignore-file", metavar="FILE", help="file of ignore globs, one per line, # comments")
     c.add_argument("--json", action="store_true", help="legacy 0.1 JSON shape (prefer --format json)")
@@ -543,7 +620,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     u = sub.add_parser("update", help="re-pin the lock after reviewing drift (needs --approve TOKEN)")
     _source_args(u)
-    u.add_argument("--lock", required=True, help="lockfile to update in place")
+    u.add_argument("--lock", default=DEFAULT_LOCK, help=f"lockfile to update in place (default {DEFAULT_LOCK})")
     u.add_argument("--approve", metavar="TOKEN", help="review token printed by `check` for the drift you read")
     u.add_argument("--auto-accept", choices=SEVERITIES, default="info",
                    help="accept drift up to this severity without a token (default info: version bumps)")
@@ -571,6 +648,10 @@ def build_parser() -> argparse.ArgumentParser:
     _output_args(sc, "high")
     sc.set_defaults(func=cmd_scan)
 
+    dm = sub.add_parser("demo", help="try it: pin an example server, then check a poisoned update (no server is run)")
+    dm.add_argument("--dir", metavar="DIR", help="keep the example files in DIR instead of a temporary folder")
+    dm.set_defaults(func=cmd_demo)
+
     sg = sub.add_parser("sign", help="sign a lockfile with an SSH key (ssh-keygen -Y sign)")
     sg.add_argument("--lock", required=True)
     sg.add_argument("--key", required=True, help="SSH private key (e.g. ~/.ssh/id_ed25519)")
@@ -589,7 +670,7 @@ def _safe_streams() -> None:
     # put in a description; never crash on output.
     for stream in (sys.stdout, sys.stderr):
         try:
-            stream.reconfigure(errors="backslashreplace")  # type: ignore[attr-defined]
+            stream.reconfigure(errors="backslashreplace")  # type: ignore[union-attr]
         except (AttributeError, ValueError, OSError):
             pass
 
@@ -613,6 +694,9 @@ def main(argv: list[str] | None = None) -> int:
     except _Exit as e:
         print(str(e), file=sys.stderr)
         return e.code
+    except KeyboardInterrupt:
+        print("mcpdrift: interrupted", file=sys.stderr)
+        return 130  # never a clean exit
     except BrokenPipeError:  # output piped into `head` etc.
         try:
             sys.stdout = open(os.devnull, "w")

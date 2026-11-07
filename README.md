@@ -12,7 +12,7 @@ An MCP server's tool names, descriptions and input schemas go straight into your
 - **Review, then approve.** `check` prints a review token; `mcpdrift update --approve TOKEN` re-pins only the exact drift you read.
 - **Offline.** Nothing leaves your machine, and nothing is sent to a scoring API.
 - **Severity-graded findings** (`info` → `critical`). A version bump is `info`. A new required argument is `medium` and tagged `breaking`. A description that suddenly mentions `~/.ssh` and tells the model to hide it from the user is `critical`.
-- **Readable diffs.** You get word-level text diffs, and invisible characters show as `​` escapes, both in the report and in the lockfile itself.
+- **Readable diffs.** You get word-level text diffs, and invisible characters show as `\u200b`-style escapes, both in the report and in the lockfile itself.
 - **Signed lockfiles** via `ssh-keygen -Y` (the same SSH key and `allowed_signers` file git uses), so nobody can quietly "re-approve" a poisoned surface.
 - **GitHub Action** that writes annotations, a markdown job summary and an optional **SARIF** file for code scanning. A pre-commit hook is included.
 
@@ -20,13 +20,22 @@ An MCP server's tool names, descriptions and input schemas go straight into your
 
 ```bash
 pip install mcpdrift
+mcpdrift demo        # 10 seconds, nothing is run: pins an example server, then checks a poisoned update
+```
 
+> **Version note (2026-11-07).** PyPI still carries `0.1.0`. Everything in this README, including `demo`, `scan`, `update`, `diff`, Streamable HTTP and the severity grading, is in `0.3.0`, which is the next release. Until it is published, install from the repository: `pip install "git+https://github.com/calasdan-sketch/mcpdrift"`. Check with `mcpdrift --version`.
+
+With your own server:
+
+```bash
 # 1. record what the server exposes today (commit this file)
 mcpdrift snapshot --config .mcp.json --server notes --out mcp.lock.json
 
-# 2. in CI: fail when the live surface no longer matches
+# 2. in CI: fail when the live surface no longer matches (--lock defaults to mcp.lock.json)
 mcpdrift check --config .mcp.json --lock mcp.lock.json
 ```
+
+Read the **exit code**: `0` clean, `1` drift, `2` could not run (bad config, server did not answer), `3` lockfile tampered. A server that stalls or crashes while listing its tools is exit `2`, never "no tools".
 
 The config is a Claude-Desktop-style `.mcp.json`:
 
@@ -34,11 +43,13 @@ The config is a Claude-Desktop-style `.mcp.json`:
 { "mcpServers": { "notes": { "command": "uvx", "args": ["some-mcp-server"], "env": {"TOKEN": "..."} } } }
 ```
 
-### Try it in 10 seconds (nothing is executed)
+### What `mcpdrift demo` does (nothing is executed)
+
+It runs these two commands on listings that ship inside the package (`mcpdrift demo --dir DIR` keeps the files so you can read them):
 
 ```bash
-mcpdrift snapshot --from-file examples/notes-v1.json --out demo.lock.json
-mcpdrift check    --from-file examples/notes-v2.json --lock demo.lock.json
+mcpdrift snapshot --from-file notes-v1.json --out demo.lock.json
+mcpdrift check    --from-file notes-v2.json --lock demo.lock.json
 ```
 
 ### What a rug pull looks like
@@ -78,6 +89,7 @@ INFO     changed server.version
 
 | Command | What it does |
 |---|---|
+| `demo` | Runs the example above from files inside the package. Exit `0` when it behaved as shown. |
 | `snapshot` | Launches the server (or reads `--from-file`) and writes the lockfile. It warns if the surface you are about to trust already looks poisoned. `--sign-key` also signs it. |
 | `check` | Diffs the live surface against the lock. Exit `1` when a finding is at least `--fail-on` severe. |
 | `scan` | Risk-scans a lock or a live server for poisoning signals, with no baseline needed. Pinning can't catch a server that was poisoned *before* you pinned it, so run this on first adoption. |
@@ -116,11 +128,11 @@ mcpdrift snapshot --config .mcp.json --server remote --allow-env MCP_TOKEN --out
 - The older HTTP+SSE transport (`"type": "sse"`) is not supported. Use `--from-file`.
 - Treat configs from forks as untrusted: a URL can point at an internal address from your runner. Use `--from-file` for those.
 
-Exit codes: `0` ok · `1` drift at/above `--fail-on` · `2` usage or server error · `3` lockfile integrity, signature or rollback failure.
+Exit codes: `0` ok · `1` drift at/above `--fail-on` · `2` usage or server error (a bad config, an unwritable file, a server that timed out or closed the pipe while listing, a lock written by a newer mcpdrift) · `3` lockfile integrity, signature or rollback failure · `130` interrupted. User errors print one plain line, never a Python traceback.
 
 Run it as `mcpdrift ...` or `python -m mcpdrift ...`. When a stdio server exits or is stopped, the whole process group it started (for example the `node` behind `npx`) is killed too (POSIX; see limits for Windows). A server that sends a `ping` or another request while we list gets an answer (`ping`) or a "not supported" error, instead of making the listing time out.
 
-Safety limits: messages over 16 MiB, more than 64 MiB from one server, more than 1000 pages or 50,000 entries are refused, never silently truncated. Output never crashes on a console that can't encode a character (such as Windows cp1252). Commands resolve through `PATH`/`PATHEXT`, so `npx` finds `npx.cmd`.
+Safety limits: messages over 16 MiB, more than 64 MiB from one server, more than 1000 pages or 50,000 entries are refused, never silently truncated. Output never crashes on a console that can't encode a character (such as Windows cp1252). Commands resolve through `PATH`/`PATHEXT`, so `npx` finds `npx.cmd`. Colour is used only on a real terminal (and on Windows only in a terminal known to understand it); `NO_COLOR` turns it off.
 
 ## GitHub Action
 
@@ -179,7 +191,7 @@ These rules are deterministic, documented, and live in `src/mcpdrift/risk.py`:
   - references to *other* tools (cross-tool steering)
   - sudden large growth
 
-  Text is NFKC-normalized and invisibles are stripped before matching, so `<IMP​ORTANT>` is still caught. Text over 200,000 characters is flagged `high`, and both its head and its tail are scanned. Only signals that are **new** in the changed text count. Two or more strong signals together become `critical`.
+  Text is NFKC-normalized and invisibles are stripped before matching, so `<IMP\u200bORTANT>` (a zero-width space inside the tag) is still caught. Text over 200,000 characters is flagged `high`, and both its head and its tail are scanned. Only signals that are **new** in the changed text count. Two or more strong signals together become `critical`.
 - **Schemas:** a new required argument, a removed argument, a type change, a narrowed enum, or newly rejected extra arguments are each `medium` and tagged `breaking`. Widened schemas are `low` and tagged `widened`. A new argument with a secret-looking name (`ssh_key`, `password`) is `high`.
 - **Annotations:** turning `destructiveHint` on or `readOnlyHint` off is `high`. Turning `openWorldHint` on is `medium`.
 - **Tools:** a removed tool is `medium` (breaking). A new tool is `medium`, and its whole definition and its name are risk-scanned, so a look-alike `read_fіle` shadowing `read_file` is `high`.
@@ -194,9 +206,9 @@ Tests make sure the following *don't* trigger:
 
 ## How it compares
 
-Every statement below links to the project's own page, as of November 2026. Re-checked on 2026-11-07 from the PyPI pages of mcp-warden-cli (2.2.0) and mcp-pin (0.1.8). The mcp-scan row was not re-checked.
+Every statement below links to the project's own page, as of November 2026. Re-checked on 2026-11-07 from the PyPI pages of mcp-warden-cli (2.2.0), mcp-pin (0.1.8) / heldfast (0.2.3, same description) and mcp-scan (0.4.3). The mcp-scan column was **not** re-checked for features; see the note under the table.
 
-| | mcpdrift | [mcp-scan](https://invariantlabs.ai/blog/introducing-mcp-scan) (Invariant / Snyk) | [mcp-warden-cli](https://pypi.org/project/mcp-warden-cli/) | [mcp-pin](https://pypi.org/project/mcp-pin/0.1.8/) / [heldfast](https://pypi.org/project/heldfast/0.2.2/) | [mcp-tool-pin-check](https://pypi.org/project/mcp-tool-pin-check/) |
+| | mcpdrift | [mcp-scan](https://invariantlabs.ai/blog/introducing-mcp-scan) (Invariant / Snyk; now a redirect to `snyk-agent-scan`) | [mcp-warden-cli](https://pypi.org/project/mcp-warden-cli/) | [mcp-pin](https://pypi.org/project/mcp-pin/0.1.8/) / [heldfast](https://pypi.org/project/heldfast/) | [mcp-tool-pin-check](https://pypi.org/project/mcp-tool-pin-check/) |
 |---|---|---|---|---|---|
 | Pins tools + resources + prompts | yes, plus resource templates and server `instructions` | tool hashing | yes (tools, resources, prompts; instructions and templates not mentioned) | tools, instructions, prompts, resources (templates not mentioned) | tools |
 | Launches stdio servers itself | yes | yes | yes | yes | no (files only) |
@@ -213,9 +225,10 @@ Every statement below links to the project's own page, as of November 2026. Re-c
 | Human approve step | `update --approve <token bound to the drift>` | – | `pin --approve --approver` | `approve` (`--yes-tool` for critical drift) | re-run `pin` |
 | Runtime blocking proxy | **no** (see mcp-leash) | not stated | `guard` | `wrap` / `gateway` | no |
 | Keeps CI secrets away from the server it launches | `--isolate-env` (opt-in) | not stated | not stated | withholds undeclared variables from child processes | no |
+| Minimum Python | 3.9 (3.11 to 3.13 tested) | 3.10 (the redirect package) | 3.11 | 3.9 | not checked |
 | Runtime dependencies | 0 | not stated | `sigstore` extra for signing | 0 | 0 (stdlib) |
 
-"–" or "not stated" means we did not find the feature on the linked page. Snyk has since launched "Agent Scan" and "Agent Guard" ([overview](https://appsecsanta.com/mcp-scan)); how they relate to mcp-scan's pinning is unverified.
+"–" or "not stated" means we did not find the feature on the linked page. PyPI says `mcp-scan` "has been renamed to snyk-agent-scan"; Snyk also launched "Agent Scan" and "Agent Guard" ([overview](https://appsecsanta.com/mcp-scan)). How they relate to the old mcp-scan's pinning is unverified, so treat that column as the 2025 mcp-scan, not the current product.
 
 ## Benchmark
 
@@ -236,8 +249,10 @@ Two more checks were added in this release; "before" is the same script run on t
 | Poison hidden in a resource template is reported | no (not pinned) | yes |
 | 24 injection phrasings detected at `high` or worse | 9/24 | 24/24 |
 | 18 benign look-alike phrases flagged | 0/18 | 0/18 |
-| `scan` of 500 tools whose text mentions another tool | 8.9 s | 0.4 s |
+| `scan` of 500 tools whose text mentions another tool | 8.9 s | 0.4 to 0.7 s (machine and load dependent) |
 | 200,000-character text of `<` followed by spaces | over 10 s (timed out) | 0.3 s |
+
+Round 4 re-ran the whole script before and after its changes: every detection result is identical; only the timings moved, within noise.
 
 The phrase list is written by the same author as the patterns, so 24/24 shows the patterns do what they say, not how they do on unseen attacks. Treat it as a regression test, not a detection rate.
 
@@ -247,7 +262,8 @@ The stability row above is a limit, not a bug: a server that waits long enough c
 
 - On a lock made by an earlier build, the first `check` after upgrading reports `server.instructions` (medium) and each resource template (low) as *added*, if the server has them. Run `mcpdrift scan`, read them, then `snapshot` again.
 - A server request that arrives over an HTTP event stream (rather than stdio) is not answered; if a server blocks on one, the listing times out.
-- Process-group cleanup and `--isolate-env` were exercised on Linux only; the Windows branches (`CREATE_NEW_PROCESS_GROUP`, a shorter environment list) are untested.
+- **Windows has never been run.** A static review was done in round 4 (see `docs/ROUND4.md`) and the Windows-only branches (`CREATE_NEW_PROCESS_GROUP`, `taskkill /T`, a shorter environment list, the retry around `os.replace`, colour off in unknown consoles) exist but are untested. CI has a Windows job that is allowed to fail until someone sees it pass. macOS is also unrun.
+- Python 3.9 and 3.10 are declared but were not run (only 3.11, 3.12 and 3.13 were). A syntax-level check found nothing newer than 3.7.
 - Two `snapshot`s writing the same lock at the same instant both produce a valid file, but the `seq` can come out lower than the number of runs.
 - The injection phrasings are English plus a few translations. A paraphrase in another language, or one that avoids the listed verbs, will pass.
 

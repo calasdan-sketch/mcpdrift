@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Deque, Dict, Iterable, List, Set
+from typing import Any, Deque, Dict, Iterable, List, Optional, Set
 
 from .canon import build_surface
 
@@ -56,6 +56,25 @@ def _sanitize(line: str) -> str:
 
 class MCPError(RuntimeError):
     """Server rejected a call, closed the pipe, or timed out."""
+
+
+class MCPRPCError(MCPError):
+    """The server answered, but with a JSON-RPC error object (``code`` is its
+    numeric code, or None). Timeouts, closed pipes and oversized messages are
+    plain ``MCPError`` and are never treated as "feature not supported"."""
+
+    def __init__(self, message: str, code: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class MCPHTTPError(MCPError):
+    """A Streamable HTTP server answered a request with a non-2xx status."""
+
+
+def rpc_error(method: str, err: Any) -> MCPRPCError:
+    code = err.get("code") if isinstance(err, dict) else None
+    return MCPRPCError(f"{method}: {err}", code if isinstance(code, int) and not isinstance(code, bool) else None)
 
 
 class StdioMCP:
@@ -124,7 +143,8 @@ class StdioMCP:
         # Drained continuously so a chatty server never blocks on a full pipe;
         # the tail is shown when something fails.
         assert self.proc.stderr is not None
-        for raw in iter(lambda: self.proc.stderr.readline(65536), b""):
+        stream = self.proc.stderr
+        for raw in iter(lambda: stream.readline(65536), b""):
             self._stderr.append(_sanitize(raw.decode("utf-8", "replace").rstrip())[:500])
 
     def stderr_tail(self) -> str:
@@ -173,7 +193,7 @@ class StdioMCP:
             if not isinstance(data, dict) or data.get("id") != self._id:
                 continue
             if "error" in data:
-                raise MCPError(f"{method}: {data['error']}")
+                raise rpc_error(method, data["error"])
             result = data.get("result")
             return result if isinstance(result, dict) else {}
 
@@ -200,6 +220,16 @@ class StdioMCP:
                 os.killpg(self.proc.pid, signal.SIGKILL)
                 return
             except (OSError, ProcessLookupError):
+                pass
+        if os.name == "nt":
+            # npx.cmd -> cmd.exe -> node: kill() would stop only the first.
+            # taskkill /T takes the whole tree (best effort; not run on Windows yet).
+            try:
+                root = os.environ.get("SystemRoot", r"C:\Windows")
+                subprocess.run([os.path.join(root, "System32", "taskkill.exe"), "/PID", str(self.proc.pid), "/T", "/F"],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=10)
+            except (OSError, subprocess.SubprocessError):
                 pass
         try:
             self.proc.kill()
@@ -244,23 +274,35 @@ LIST_KEYS = {"tools/list": "tools", "resources/list": "resources", "prompts/list
              "resources/templates/list": "resourceTemplates"}
 
 
-def _list_or_empty(client: "StdioMCP", method: str) -> List[Dict[str, Any]]:
+METHOD_NOT_FOUND = -32601
+CAPABILITY_OF = {"tools/list": "tools", "resources/list": "resources", "prompts/list": "prompts",
+                 "resources/templates/list": "resources"}
+
+
+def _list_or_empty(client: Any, method: str, advertised: bool = False) -> List[Dict[str, Any]]:
     """List a capability, following ``nextCursor`` pagination.
 
-    Servers without the capability answer method-not-found, which yields an
-    empty list. A failure on a *later* page is an error, not a silent
-    truncation: a half-read surface would make the lock lie.
+    A server that answers "method not found" (or any JSON-RPC error or HTTP
+    error status while it did not advertise the capability in ``initialize``)
+    has an empty section.
+    Anything else on the first page (a timeout, a closed pipe, an HTTP error,
+    an oversized message, an error for a capability it advertised) is an
+    error, never "empty": otherwise a server that crashes or stalls on
+    ``tools/list`` would pin, or pass, as having no tools. A failure on a
+    *later* page is likewise an error: a half-read surface would make the
+    lock lie.
     """
     key = LIST_KEYS[method]
     items: List[Dict[str, Any]] = []
     cursor = None
-    seen = set()
+    seen: set = set()
     for page in range(MAX_PAGES):
-        params = {"cursor": cursor} if cursor is not None else None
+        params: Optional[Dict[str, Any]] = {"cursor": cursor} if cursor is not None else None
         try:
             result = client.request(method, params)
-        except MCPError:
-            if page == 0:
+        except (MCPRPCError, MCPHTTPError) as e:
+            missing = isinstance(e, MCPRPCError) and e.code == METHOD_NOT_FOUND
+            if page == 0 and (missing or not advertised):
                 return []
             raise
         batch = result.get(key, [])
@@ -361,12 +403,18 @@ def fetch_capture(
             },
         )
         client.notify("notifications/initialized")
+        caps = init.get("capabilities") if isinstance(init, dict) else None
+        caps = caps if isinstance(caps, dict) else {}
+
+        def listing(method: str) -> List[Dict[str, Any]]:
+            return _list_or_empty(client, method, CAPABILITY_OF[method] in caps)
+
         taken: List[Dict[str, Any]] = []
         for _ in range(samples):
-            tools = _list_or_empty(client, "tools/list")
-            resources = _list_or_empty(client, "resources/list")
-            prompts = _list_or_empty(client, "prompts/list")
-            templates = _list_or_empty(client, "resources/templates/list")
+            tools = listing("tools/list")
+            resources = listing("resources/list")
+            prompts = listing("prompts/list")
+            templates = listing("resources/templates/list")
             taken.append(build_surface(init, tools, resources, prompts, templates))
         return Capture(taken[0], taken, set(client.notifications))
     finally:

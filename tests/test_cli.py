@@ -1,7 +1,6 @@
 """CLI-level tests: snapshot writes a lock, check exits 1 on drift."""
 import json
 
-import pytest
 
 from mcpdrift.cli import main
 from tests.test_client import TOOLS, server_cmd
@@ -59,13 +58,11 @@ def test_missing_lock_is_usage_error(tmp_path, capsys):
 
 def test_unknown_server_is_usage_error(tmp_path, capsys):
     cfg = write_config(tmp_path, TOOLS)
-    with pytest.raises(SystemExit):
-        main(["snapshot", "--config", cfg, "--server", "ghost"])
+    assert main(["snapshot", "--config", cfg, "--server", "ghost"]) == 2
 
 
 def test_multi_server_requires_name(tmp_path):
     cfg = tmp_path / "multi.json"
     cmd = server_cmd(TOOLS)
     cfg.write_text(json.dumps({"mcpServers": {"a": {"command": cmd}, "b": {"command": cmd}}}), encoding="utf-8")
-    with pytest.raises(SystemExit):
-        main(["snapshot", "--config", str(cfg)])
+    assert main(["snapshot", "--config", str(cfg)]) == 2

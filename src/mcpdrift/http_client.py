@@ -27,7 +27,7 @@ import time
 from typing import Any, Dict, Iterable, Optional, Set
 from urllib.parse import urlsplit
 
-from .client import MAX_LINE_BYTES, MAX_TOTAL_BYTES, MCPError
+from .client import MAX_LINE_BYTES, MAX_TOTAL_BYTES, MCPError, MCPHTTPError, rpc_error
 
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
 _VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -96,10 +96,11 @@ class HttpMCP:
     def _conn(self) -> http.client.HTTPConnection:
         p = self.parts
         port = p.port
+        host = p.hostname or ""
         if p.scheme == "https":
-            return http.client.HTTPSConnection(p.hostname, port, timeout=self.timeout,
+            return http.client.HTTPSConnection(host, port, timeout=self.timeout,
                                                context=ssl.create_default_context())
-        return http.client.HTTPConnection(p.hostname, port, timeout=self.timeout)
+        return http.client.HTTPConnection(host, port, timeout=self.timeout)
 
     def _path(self) -> str:
         p = self.parts
@@ -204,7 +205,7 @@ class HttpMCP:
                 raise MCPError(f"{method}: server redirected (HTTP {resp.status}); redirects are not followed")
             if resp.status >= 400:
                 self._read_body(resp, 4096)
-                raise MCPError(f"{method}: HTTP {resp.status}{self._hint(resp.status)}")
+                raise MCPHTTPError(f"{method}: HTTP {resp.status}{self._hint(resp.status)}")
             sid = resp.getheader("Mcp-Session-Id")
             if sid and method == "initialize":
                 if not re.fullmatch(r"[\x21-\x7e]{1,256}", sid):
@@ -230,7 +231,7 @@ class HttpMCP:
         finally:
             conn.close()
         if "error" in data:
-            raise MCPError(f"{method}: {data['error']}")
+            raise rpc_error(method, data["error"])
         result = data.get("result")
         if method == "initialize" and isinstance(result, dict):
             pv = result.get("protocolVersion")

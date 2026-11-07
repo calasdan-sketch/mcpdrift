@@ -443,7 +443,7 @@ def text_signals(text: str, other_names: "Sequence[str] | _Others" = (), allow_u
     return out
 
 
-def _new_signals(old_text: Any, new_text: Any, names: Sequence[str], allow_urls: bool = False) -> List[Tuple[str, str]]:
+def _new_signals(old_text: Any, new_text: Any, names: Any, allow_urls: bool = False) -> List[Tuple[str, str]]:
     old = {r for _, r in text_signals(old_text, names, allow_urls)} if isinstance(old_text, str) else set()
     # Compare on the signal *kind* (text before ':') so a URL that merely
     # changes is still new, but the same category of phrase that was already
@@ -493,7 +493,7 @@ def _url_ok(parts: Tuple[str, ...]) -> bool:
     return any(x in URL_KEYS for x in parts[-2:])
 
 
-def _signals_at(parts: Tuple[str, ...], text: str, names: Sequence[str]) -> List[Tuple[str, str]]:
+def _signals_at(parts: Tuple[str, ...], text: str, names: Any) -> List[Tuple[str, str]]:
     return text_signals(text, names, allow_urls=_url_ok(parts))
 
 
@@ -528,7 +528,7 @@ def _get(surface: Dict[str, Any], parts: Sequence[str]) -> Any:
 
 
 def _all_names(*surfaces: Dict[str, Any]) -> List[str]:
-    names = set()
+    names: set = set()
     for s in surfaces:
         for sec in ("tools", "prompts"):
             entries = s.get(sec) if isinstance(s, dict) else None
@@ -547,7 +547,7 @@ def _owner(parts: Tuple[str, ...]) -> Optional[str]:
 # assessment
 
 
-def _assess_entry_added(a: Assessed, entry: Any, names: Sequence[str]) -> None:
+def _assess_entry_added(a: Assessed, entry: Any, names: Any) -> None:
     section = a.parts[0]
     others = names.without(a.parts[1])
     a.bump("medium" if section == "tools" else "low",
@@ -623,10 +623,10 @@ def _assess_schema(a: Assessed, old_s: Dict[str, Any], new_s: Dict[str, Any]) ->
         return
 
     if last == "enum":
-        o = a.old if isinstance(a.old, list) else []
-        n = a.new if isinstance(a.new, list) else []
-        gone = [x for x in o if x not in n]
-        new = [x for x in n if x not in o]
+        ol = a.old if isinstance(a.old, list) else []
+        nl = a.new if isinstance(a.new, list) else []
+        gone = [x for x in ol if x not in nl]
+        new = [x for x in nl if x not in ol]
         if gone and not is_output:
             a.bump("medium", "allowed value(s) removed: " + brief(gone, 60), "breaking")
         if new:
@@ -683,7 +683,7 @@ def _assess_annotations(a: Assessed) -> bool:
     return True
 
 
-def _scan_new_strings(a: Assessed, o: Any, n: Any, others: Sequence[str]) -> None:
+def _scan_new_strings(a: Assessed, o: Any, n: Any, others: Any) -> None:
     """Every string the change introduces (defaults, enums, consts, examples,
     nested descriptions, unknown fields) gets the same text checks."""
     before = set(t for _, t in iter_texts(o)) if not is_missing(o) else set()

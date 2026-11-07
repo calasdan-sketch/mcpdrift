@@ -7,24 +7,46 @@ permissions:
   contents: read
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    # Windows and macOS have never been run by the author; let them report
+    # without blocking until someone has seen them pass.
+    continue-on-error: ${{ matrix.os != 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.9", "3.12"]
+        include:
+          - { os: windows-latest, python-version: "3.12" }
+          - { os: macos-latest, python-version: "3.12" }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
       - name: Install
-        run: pip install -e . pytest build twine
+        run: pip install -e . pytest ruff
+      - name: Lint
+        run: ruff check .
       - name: Test
         run: pytest -q
       - name: CLI smoke
         run: mcpdrift --version
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Build
-        run: python -m build
+        run: pip install build twine && python -m build
       - name: Twine check
         run: twine check dist/*
-
+      - name: Install the wheel in a clean venv and run the demo
+        run: |
+          python -m venv /tmp/clean
+          /tmp/clean/bin/pip install dist/*.whl
+          cd "$(mktemp -d)"
+          /tmp/clean/bin/mcpdrift --version
+          /tmp/clean/bin/mcpdrift demo

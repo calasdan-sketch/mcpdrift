@@ -4,6 +4,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import posixpath
 import re
 import secrets
@@ -130,7 +131,7 @@ def render_markdown(items: Sequence[Assessed], title: str = "mcpdrift", noun: st
     diffs = [(a, d) for a, d in diffs if d is not None]
     if diffs:
         out += ["", "<details><summary>Text changes (word diff)</summary>", ""]
-        for a, d in diffs:
+        for a, _d in diffs:
             body = (f"- {_visible(a.old)}".replace("\n", "\n- ") + "\n"
                     + f"+ {_visible(a.new)}".replace("\n", "\n+ "))
             # Fence longer than any backtick run inside, so hostile text
@@ -267,6 +268,13 @@ def locate_line(lock_text: str, parts: Sequence[str]) -> int:
 
 
 def _sarif_uri(path: str) -> str:
+    if os.path.isabs(path):  # inside the working folder: keep the relative path code scanning needs
+        try:
+            rel = os.path.relpath(path)
+            if not rel.startswith("..") and not os.path.isabs(rel):
+                path = rel
+        except ValueError:  # other drive on Windows
+            pass
     p = path.replace("\\", "/")
     if p.startswith("/") or re.match(r"^[A-Za-z]:", p) or ".." in p.split("/"):
         return posixpath.basename(p) or "mcp.lock.json"

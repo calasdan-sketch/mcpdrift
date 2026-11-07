@@ -1,24 +1,65 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcpdrift"
-version = "0.3.0"
+dynamic = ["version"]
 description = "Pin your MCP servers' tool surface in a lockfile and fail CI when it drifts"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"
-authors = [{ name = "calasdan-sketch" }]
-keywords = ["mcp", "model-context-protocol", "lockfile", "drift", "ci", "agents"]
+license-files = ["LICENSE"]
+authors = [{ name = "Dan Calas" }]
+keywords = ["mcp", "model-context-protocol", "lockfile", "drift", "ci", "agents", "security", "supply-chain"]
 classifiers = [
-    "Programming Language :: Python :: 3",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
     "Topic :: Software Development :: Quality Assurance",
+    "Typing :: Typed",
 ]
+
+[project.urls]
+Homepage = "https://github.com/calasdan-sketch/mcpdrift"
+Source = "https://github.com/calasdan-sketch/mcpdrift"
+Issues = "https://github.com/calasdan-sketch/mcpdrift/issues"
+Changelog = "https://github.com/calasdan-sketch/mcpdrift/blob/main/CHANGELOG.md"
 
 [project.scripts]
 mcpdrift = "mcpdrift.cli:main"
 
+[tool.setuptools.dynamic]
+version = { attr = "mcpdrift.__version__" }
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+mcpdrift = ["py.typed", "examples/*.json"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E9", "F", "B", "PLE"]
+ignore = ["B008", "B904", "B905"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B", "PLE2502", "PLE2515", "PLE2510", "PLE2512", "PLE2513", "PLE2514"]
+"src/mcpdrift/risk.py" = ["PLE2502", "PLE2515"]
+"src/mcpdrift/render.py" = ["PLE2502", "PLE2515"]
+
+[tool.mypy]
+python_version = "3.10"
+ignore_missing_imports = true

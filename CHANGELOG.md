@@ -2,6 +2,18 @@
 
 ## 0.3.0 (unreleased)
 
+### Round 4: what a stranger gets from `pip install`
+- **`mcpdrift demo`**: the 10-second example now ships inside the package. Before, the README quick start pointed at `examples/*.json`, which the wheel never contained, so it failed after `pip install`. `demo --dir DIR` keeps the files.
+- **A listing that fails is an error, not "no tools".** A server that timed out, closed its pipe, sent an oversized message, or (over HTTP) answered 500 on `tools/list` used to be recorded as an empty section: `snapshot` would pin zero tools and `check` reported a "removed tool" (medium) that `--fail-on high` let through. Now only a JSON-RPC "method not found" (or any JSON-RPC error for a capability the server never advertised) means "empty". Everything else exits 2 and writes nothing.
+- **Exit codes**: a missing or invalid config, an unknown `--server`, or no `--config`/`--from-file` used to exit `1` (the code for drift). They exit `2` now. Ctrl-C exits `130`.
+- A lock whose `lockfile_version` is newer than this build understands is refused (exit 2, "upgrade mcpdrift") instead of being compared as if it were understood.
+- `check` and `update` default `--lock` to `mcp.lock.json`. A config with a single server still works after the server is renamed.
+- Writing a lock/report to a missing folder or read-only location gives one plain sentence (before: a temp-file name). `os.replace` is retried briefly on Windows, where an editor or scanner can hold the target.
+- Windows (reviewed statically, **not run**): the whole process tree is stopped with `taskkill /T`; colour is off unless the console is known to understand it; SARIF paths are relative to the working folder.
+- Packaging: `py.typed`, `Typing :: Typed`, Python 3.9 to 3.13 classifiers, project URLs, a real author, `license-files`, a sdist that carries CHANGELOG, tests, bench and the example listings, `setuptools>=77` (the SPDX `license = "MIT"` string needs it), and one version number (`mcpdrift.__version__`; `pyproject.toml` reads it).
+- Housekeeping: ruff (`E9,F,B,PLE`) and mypy are clean and ruff runs in CI; CI also builds the wheel, installs it into a clean venv and runs `mcpdrift demo`, and has Windows and macOS jobs that may fail until someone has seen them pass. A literal zero-width space in the README is now written as an escape, and tests keep invisible characters out of the docs.
+- README: version note (PyPI has 0.1.0), competitor versions re-checked on 2026-11-07 (mcp-scan is now a redirect to snyk-agent-scan), honest Windows and Python-version limits.
+
 ### Round 3 additions
 - **Pinned now**: server `instructions`, `serverInfo` title/description/websiteUrl, the negotiated `protocolVersion`, and `resources/templates/list` (resource templates). All are risk-scanned like descriptions; `scan` covers them too. Fields are stored only when the server sends them.
 - `mcpdrift diff OLD NEW` compares two lockfiles with no server involved; `python -m mcpdrift` works.

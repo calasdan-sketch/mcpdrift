@@ -82,8 +82,8 @@ def build_surface(
     init = init_result if isinstance(init_result, dict) else {}
     for part in (init, tools, resources, prompts, templates):
         check_depth(part)
-    info = init.get("serverInfo") if isinstance(init.get("serverInfo"), dict) else {}
-    caps = init.get("capabilities") if isinstance(init.get("capabilities"), dict) else {}
+    info: Dict[str, Any] = init["serverInfo"] if isinstance(init.get("serverInfo"), dict) else {}
+    caps: Dict[str, Any] = init["capabilities"] if isinstance(init.get("capabilities"), dict) else {}
     server: Dict[str, Any] = {
         "name": info.get("name"),
         "version": info.get("version"),
