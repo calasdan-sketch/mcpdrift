@@ -31,6 +31,7 @@ _STRONG_KINDS = {
     "look-alike word(s) in a non-Latin script",
     "contains an HTML comment (hidden from rendered views, read by the model)",
     "base64-encoded text",
+    "markdown image URL carries a data placeholder (leak channel)",
     "contains control characters (can forge log or CI output)",
 }
 _NAME_KINDS = {
@@ -55,7 +56,8 @@ def name_signals(name: str) -> List[Tuple[str, str]]:
 _RANK = {s: i for i, s in enumerate(SEVERITIES)}
 
 TEXT_KEYS = {"description", "title"}
-SECTIONS = ("tools", "resources", "prompts")
+SECTIONS = ("tools", "resources", "prompts", "resourceTemplates")
+SERVER_TEXT_KEYS = ("instructions", "title", "description", "websiteUrl")
 
 # Hard caps so a hostile server cannot make the scorer slow.
 MAX_TEXT = 200_000
@@ -134,18 +136,36 @@ _CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _TAGS_BLOCK = re.compile("[\U000e0000-\U000e007f]")
 
 _INSTRUCTION = re.compile(
-    r"<\s*/?\s*(important|system|instructions?|secret|hidden|admin|critical|note_to_ai|ai)\b[^>]{0,40}>"
+    r"<[ \t\r\n]{0,20}/?[ \t\r\n]{0,20}(important|system|instructions?|secret|hidden|admin|critical|note_to_ai|ai)\b[^>]{0,40}>"
     r"|\[\s*(system|important|critical|admin)\s*\]"
     r"|\*\*\s*system\s*\*\*"
     r"|\bignore\s+(all\s+|any\s+)?(the\s+)?(previous|prior|above|earlier|other)\s+(instructions|rules|directions)"
     r"|\b(do\s+not|don't|never)\s+(tell|inform|mention|reveal|show|notify|alert)\s+(this\s+to\s+)?(the\s+)?user"
-    r"|\bwithout\s+(telling|informing|notifying|asking)\s+(the\s+)?user",
+    r"|\bwithout\s+(telling|informing|notifying|asking)\s+(the\s+)?user"
+    # other verbs / phrasings used by published injection corpora
+    r"|\b(disregard|forget|override|overrule)\s+(all\s+|any\s+|every\s+)?(the\s+|your\s+)?"
+    r"(previous|prior|above|earlier|other|system|original|safety)\s+"
+    r"(instructions?|rules|guidelines|guidance|directions|prompts?|polic(?:y|ies)|messages)"
+    r"|\bforget\s+everything\s+(you|above|before)"
+    r"|(^|\n)[ \t]*(system|assistant|developer)[ \t]*(prompt|message)?[ \t]*:[ \t]*you\b"
+    r"|\byou\s+are\s+now\s+(in\s+)?(a\s+|an\s+)?(developer|debug|admin|god|jailbreak|unrestricted)\b"
+    r"|\b(silently|secretly|covertly|quietly|discreetly|invisibly)\s+(call|invoke|run|execute|send|post|"
+    r"read|upload|forward|fetch|copy)\b"
+    r"|<\|(im_start|im_end|system|endoftext)\|>|\[/?INST\]|<<\s*/?SYS\s*>>"
+    # the same instruction in other widely used languages (heuristic)
+    r"|\bignor(?:ez|e)\s+(?:toutes\s+)?les\s+instructions\s+(?:pr[ée]c[ée]dentes|ci-dessus)"
+    r"|\bignora\s+(?:todas\s+)?las\s+instrucciones\s+(?:anteriores|previas)"
+    r"|\bignor(?:e|iere)\s+(?:todas\s+as\s+|alle\s+)?(?:instru[cç][õo]es\s+anteriores|(?:vorherigen|bisherigen|obigen)\s+anweisungen)"
+    r"|忽略(?:之前|以上|先前|上述)(?:的)?(?:所有)?(?:指令|指示|说明|提示)"
+    r"|игнорируй(?:те)?\s+(?:все\s+)?(?:предыдущие|прежние)\s+инструкции",
     re.IGNORECASE,
 )
 # Weaker phrasing that legitimate docs also use; worth a look, not an alarm.
 _INSTRUCTION_WEAK = re.compile(
     r"\b(before|prior\s+to)\s+(using|calling|invoking)\s+(this|any|the)\s+tool"
-    r"|\bthis\s+is\s+(very\s+|extremely\s+)?important\b",
+    r"|\bthis\s+is\s+(very\s+|extremely\s+)?important\b"
+    r"|\b(always|must|should)\s+(use|call|prefer)\s+this\s+tool\s+(instead\s+of|over|rather\s+than|before|first)\b"
+    r"|\binstead\s+of\s+(using\s+)?(the\s+|any\s+)?other\s+tools?\b",
     re.IGNORECASE,
 )
 
@@ -156,7 +176,10 @@ _SENSITIVE_PATH = re.compile(
     r"|/etc/(passwd|shadow|sudoers)"
     r"|\b(mcp|claude_desktop_config)\.json\b"
     r"|\bprivate[\s_-]?key\b"
-    r"|\bseed\s+phrase\b|\bwallet\.dat\b",
+    r"|\bseed\s+phrase\b|\bwallet\.dat\b"
+    r"|\.config[/\\](gcloud|gh|azure|git)\b|[/\\]\.azure\b|\bkubeconfig\b|\.kube[/\\]config"
+    r"|\.(bash|zsh|psql|mysql)_history\b|application_default_credentials|\bknown_hosts\b|\bauthorized_keys\b"
+    r"|\.vault-token|\.pgpass|\.s3cfg|\bterraform\.tfstate\b|/proc/self/environ|login\s+data\b",
     re.IGNORECASE,
 )
 # Generic secret words: normal in a GitHub or auth tool, notable when new.
@@ -166,9 +189,19 @@ _SENSITIVE_WORD = re.compile(
     re.IGNORECASE,
 )
 
+# Environment variables that hold credentials, named in text. Case-sensitive.
+_SECRET_ENV = re.compile(
+    r"\b(?:AWS_SECRET_ACCESS_KEY|AWS_SESSION_TOKEN|OPENAI_API_KEY|ANTHROPIC_API_KEY|GITHUB_TOKEN|GH_TOKEN|NPM_TOKEN)\b"
+    r"|\b[A-Z][A-Z0-9]*_(?:API_KEY|SECRET_KEY|SECRET|ACCESS_TOKEN|AUTH_TOKEN|PASSWORD)\b"
+)
+# Markdown images are fetched automatically by many chat UIs: a URL that
+# carries a placeholder ({secret}, <data>, ${VAR}) is the classic leak channel.
+_MD_IMAGE_URL = re.compile(r"!\[[^\]\n]{0,200}\]\(\s{0,5}(https?://[^)\s]{0,500})", re.IGNORECASE)
+_PLACEHOLDER = re.compile(r"[?&#][^{}<>$\[]{0,200}(?:\{[^}]{0,100}\}|%7B|<[^>]{0,100}>|\$\{|\[[^\]]{0,100}\])", re.IGNORECASE)
+
 _EXFIL = re.compile(
     # verb ... to/into/via <external destination>
-    r"\b(send|post|upload|forward|transmit|exfiltrate|leak|copy|include|pass|append|attach|embed)\b"
+    r"\b(send|post|upload|forward|transmit|exfiltrate|leak|copy|include|pass|append|attach|embed|email|mail)\b"
     r"[^.\n]{0,80}\b(to|into|via)\b\s+(the\s+|an?\s+|this\s+)?"
     r"(https?://|webhook\b|external\s+(server|endpoint|url)\b|[\w.+-]+@[\w-]+\.[a-z]{2,})"
     # ... or smuggled through a side-channel argument
@@ -194,6 +227,70 @@ _SENSITIVE_NAME = re.compile(
 )
 
 _SCRIPT_PREFIXES = ("LATIN", "CYRILLIC", "GREEK", "ARMENIAN", "CHEROKEE")
+
+
+_WORD_RUN = re.compile(r"[\w-]+")
+_PLAIN_NAME = re.compile(r"[\w-]+\Z")
+
+
+class NameIndex:
+    """Fast "does this text mention another tool's name" lookup.
+
+    The naive version compiled one regex per tool name per text, which is
+    quadratic: 500 tools took ~20 s to scan and a hostile server could list
+    50,000. A name made only of word characters and ``-`` can only match as
+    a whole token, so it is found with a set lookup instead.
+    """
+
+    def __init__(self, names: Iterable[str]) -> None:
+        self.plain: Dict[str, List[str]] = {}
+        self.odd: Dict[str, List[str]] = {}  # names with other characters, keyed by first word run
+        self.rest: List[str] = []
+        for n in sorted(set(x for x in names if isinstance(x, str) and len(x) >= 4)):
+            if _PLAIN_NAME.match(n):
+                self.plain.setdefault(n.lower(), []).append(n)
+            else:
+                m = _WORD_RUN.match(n.lower())
+                if m:
+                    self.odd.setdefault(m.group(0), []).append(n)
+                elif len(self.rest) < 200:
+                    self.rest.append(n)
+
+    def without(self, owner: Optional[str]) -> "_Others":
+        return _Others(self, owner)
+
+    def __len__(self) -> int:
+        return len(self.plain) + len(self.odd) + len(self.rest)
+
+
+class _Others:
+    def __init__(self, index: NameIndex, owner: Optional[str]) -> None:
+        self.index, self.owner = index, owner
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def find(self, low: str) -> Optional[str]:
+        ix = self.index
+        tokens = set(_WORD_RUN.findall(low))
+        for tok in sorted(tokens):
+            for n in ix.plain.get(tok, ()):
+                if n != self.owner:
+                    return n
+        for tok in sorted(tokens):
+            for n in ix.odd.get(tok, ()):
+                if n != self.owner and re.search(r"(?<![\w-])" + re.escape(n.lower()) + r"(?![\w-])", low):
+                    return n
+        for n in ix.rest:
+            if n != self.owner and re.search(r"(?<![\w-])" + re.escape(n.lower()) + r"(?![\w-])", low):
+                return n
+        return None
+
+
+def _as_others(names: Any) -> "_Others":
+    if isinstance(names, _Others):
+        return names
+    return NameIndex(names).without(None)
 
 
 def _scripts_in(word: str) -> set:
@@ -263,7 +360,7 @@ def _normalize(text: str) -> str:
     return _STRIP.sub("", unicodedata.normalize("NFKC", text))
 
 
-def text_signals(text: str, other_names: Sequence[str] = (), allow_urls: bool = False,
+def text_signals(text: str, other_names: "Sequence[str] | _Others" = (), allow_urls: bool = False,
                  _depth: int = 0) -> List[Tuple[str, str]]:
     """Return (severity, reason) pairs for risky content in ``text``.
 
@@ -324,17 +421,25 @@ def text_signals(text: str, other_names: Sequence[str] = (), allow_urls: bool = 
     m = _SENSITIVE_WORD.search(norm)
     if m:
         out.append(("medium", f"mentions credentials: {m.group(0).strip()[:40]!r}"))
+    m = _SECRET_ENV.search(text)
+    if m:
+        out.append(("medium", f"mentions a secret environment variable: {m.group(0)[:40]!r}"))
     m = _EXFIL.search(norm)
     if m:
         out.append(("high", f"exfiltration-style wording: {m.group(0)[:60]!r}"))
+    imgs = [m for _, m in zip(range(20), _MD_IMAGE_URL.finditer(norm))]
+    leak = next((m for m in imgs if _PLACEHOLDER.search(m.group(1))), None)
+    if leak:
+        out.append(("high", f"markdown image URL carries a data placeholder (leak channel): {leak.group(0)[:60]!r}"))
+    elif imgs:
+        out.append(("medium", "markdown image (chat UIs fetch it automatically)"))
     urls = [] if allow_urls else _URL.findall(norm)
     if urls:
         out.append(("medium", "contains URL(s): " + ", ".join(u[:60] for u in urls[:3])))
-    low = norm.lower()
-    for name in other_names:
-        if len(name) >= 4 and re.search(r"(?<![\w-])" + re.escape(name.lower()) + r"(?![\w-])", low):
-            out.append(("medium", f"refers to another tool: {name!r} (cross-tool steering)"))
-            break
+    if other_names is not None and len(other_names):
+        hit = _as_others(other_names).find(norm.lower())
+        if hit is not None:
+            out.append(("medium", f"refers to another tool: {hit!r} (cross-tool steering)"))
     return out
 
 
@@ -444,7 +549,7 @@ def _owner(parts: Tuple[str, ...]) -> Optional[str]:
 
 def _assess_entry_added(a: Assessed, entry: Any, names: Sequence[str]) -> None:
     section = a.parts[0]
-    others = [n for n in names if n != a.parts[1]]
+    others = names.without(a.parts[1])
     a.bump("medium" if section == "tools" else "low",
            f"new {section[:-1]} the agent can now see/use", "added")
     for sev, reason in name_signals(a.parts[1]):
@@ -460,6 +565,14 @@ def _assess_entry_added(a: Assessed, entry: Any, names: Sequence[str]) -> None:
             if _SENSITIVE_NAME.search(pname):
                 a.bump("high", f"asks for a sensitive-looking argument: {pname!r}", "security")
                 break
+
+
+def _hset(v: Any) -> set:
+    """A set of the items of ``v`` even if a hostile server put dicts or
+    lists where strings belong (those used to raise TypeError)."""
+    if not isinstance(v, list):
+        return set()
+    return {x if isinstance(x, (str, int, float, bool, type(None))) else repr(x) for x in v}
 
 
 def _schema_context(parts: Tuple[str, ...]) -> Optional[int]:
@@ -499,8 +612,8 @@ def _assess_schema(a: Assessed, old_s: Dict[str, Any], new_s: Dict[str, Any]) ->
         return
 
     if last == "required":
-        o = set(a.old) if isinstance(a.old, list) else set()
-        n = set(a.new) if isinstance(a.new, list) else set()
+        o = _hset(a.old)
+        n = _hset(a.new)
         if is_output:
             a.bump("low", "output required fields changed")
         elif n - o:
@@ -588,7 +701,7 @@ def assess_changes(
     raw: Sequence[RawChange], old: Dict[str, Any], new: Dict[str, Any]
 ) -> List[Assessed]:
     """Score raw structural changes. Output order follows ``raw``."""
-    names = _all_names(old, new)
+    names = NameIndex(_all_names(old, new))
     out: List[Assessed] = []
     for kind, parts, o, n in raw:
         if kind == "removed":
@@ -600,7 +713,7 @@ def assess_changes(
         a = Assessed(kind, join_path(parts), parts, detail, "info",
                      old=None if is_missing(o) else o, new=None if is_missing(n) else n)
         owner = _owner(parts)
-        others = [x for x in names if x != owner]
+        others = names.without(owner)
         section = parts[0] if parts else ""
 
         if section == "server":
@@ -608,6 +721,22 @@ def assess_changes(
                 a.bump("info", "server version changed")
             elif parts[1:2] == ("name",):
                 a.bump("medium", "server identity (serverInfo.name) changed", "security")
+            elif len(parts) >= 2 and parts[1] in SERVER_TEXT_KEYS:
+                key = parts[1]
+                what = {"added": "added", "removed": "removed"}.get(kind, "changed")
+                # A lock from before this change never recorded title/description/websiteUrl, so
+                # "added" alone is only informational; instructions stay medium because
+                # an added instructions block is exactly what an attack would look like.
+                base = "medium" if key == "instructions" else ("info" if kind == "added" else "low")
+                a.bump(base, f"server {key} {what} (clients may put this text in the model's context)", "text")
+                if isinstance(a.new, str):
+                    for sev, reason in _new_signals(a.old if isinstance(a.old, str) else None, a.new, others,
+                                                    key == "websiteUrl"):
+                        a.bump(sev, reason, "security")
+                    if isinstance(a.old, str) and len(a.new) > 2 * len(a.old) + 200:
+                        a.bump("medium", f"text grew from {len(a.old)} to {len(a.new)} characters")
+            elif parts[1:2] == ("protocolVersion",):
+                a.bump("info" if kind == "added" else "low", "negotiated protocol version changed (fields the server sends may differ)")
             else:
                 a.bump("low", "server capabilities changed")
         elif section in SECTIONS and len(parts) == 2:
@@ -642,15 +771,26 @@ def scan_surface(surface: Dict[str, Any]) -> List[Assessed]:
     """Risk-scan a whole surface (e.g. the baseline lock). Pinning cannot catch
     a server that was poisoned *before* you snapshotted it; this can, for the
     same signals the drift scorer uses."""
-    names = _all_names(surface)
+    names = NameIndex(_all_names(surface))
     out: List[Assessed] = []
+    srv = surface.get("server")
+    if isinstance(srv, dict):
+        for key in SERVER_TEXT_KEYS:
+            v = srv.get(key)
+            if isinstance(v, str):
+                sigs = text_signals(v, names.without(None), allow_urls=(key == "websiteUrl"))
+                if sigs:
+                    a = Assessed("present", f"server.{key}", ("server", key), brief(v), "info", new=v)
+                    for sev, reason in sigs:
+                        a.bump(sev, reason, "security")
+                    out.append(a.finish())
     for section in SECTIONS:
         entries = surface.get(section) or {}
         if not isinstance(entries, dict):
             continue
         for name in sorted(entries):
             entry = entries[name]
-            others = [x for x in names if x != name]
+            others = names.without(name)
             nsig = name_signals(name)
             if nsig:
                 a = Assessed("present", join_path((section, name)), (section, name), repr(name), "info", new=name)

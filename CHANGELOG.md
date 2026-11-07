@@ -2,6 +2,23 @@
 
 ## 0.3.0 (unreleased)
 
+### Round 3 additions
+- **Pinned now**: server `instructions`, `serverInfo` title/description/websiteUrl, the negotiated `protocolVersion`, and `resources/templates/list` (resource templates). All are risk-scanned like descriptions; `scan` covers them too. Fields are stored only when the server sends them.
+- `mcpdrift diff OLD NEW` compares two lockfiles with no server involved; `python -m mcpdrift` works.
+- `--isolate-env` / Action `isolate-env`: a stdio server gets a minimal environment, not the CI job's secrets.
+- A server's `ping` gets an answer and its other requests get a "not supported" error (before, a server that waited on us made the listing time out). The server's process group is killed on exit, so `npx` children are not orphaned.
+- Context-footprint finding when model-visible text grows a lot; `snapshot` prints the footprint.
+- Wider text signals (more injection verbs and chat-template tokens, six languages, more credential locations, secret environment variables, markdown-image leaks), checked against benign phrases in tests.
+- A bad listing now exits 2 with a one-line message instead of a traceback: listings nested over 400 levels are refused, and unexpected internal errors exit 2.
+
+### Fixed in round 3
+- `scan` and `check` were quadratic in the number of tools (500 tools took about 9 s; a hostile server may list 50,000). Cross-tool name matching is now a token lookup.
+- `required` or `enum` lists containing objects or lists crashed the scorer with `TypeError`.
+- Two regular expressions backtracked badly on 200,000-character text (`<` followed by spaces; newlines followed by `system`).
+
+### Compatibility (round 3)
+- First `check` against a lock from an earlier build reports `server.instructions` (medium) and resource templates (low) as added when the server has them; added title, description, websiteUrl and protocolVersion are `info`. Re-snapshot after reviewing.
+
 ### Added
 - **Streamable HTTP servers** (`url` + `headers` in the config), JSON or event-stream responses, sessions, pagination. Plain http only to loopback, no redirects, URL credentials refused, `${VAR}` in headers only for `--allow-env` names.
 - **Semantic normalization**: reordered `required`, `enum`, `type` unions and `anyOf`/`oneOf`/`allOf`, and ASCII whitespace-only changes in descriptions, are no longer drift. The lock still stores the raw surface; `--strict` restores exact comparison. Non-ASCII characters are never normalized.

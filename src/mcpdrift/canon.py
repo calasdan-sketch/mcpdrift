@@ -16,6 +16,27 @@ RawChange = Tuple[str, Tuple[str, ...], Any, Any]  # (kind, parts, old, new)
 _MISSING = object()
 
 
+MAX_DEPTH = 400
+
+
+class SurfaceError(ValueError):
+    """The listing cannot be pinned safely (for example, absurd nesting)."""
+
+
+def check_depth(obj: Any, limit: int = MAX_DEPTH) -> None:
+    """Iterative depth guard: real schemas nest a few dozen levels at most;
+    deeper input is refused instead of crashing recursive code later."""
+    stack = [(obj, 1)]
+    while stack:
+        cur, d = stack.pop()
+        if d > limit:
+            raise SurfaceError(f"listing is nested more than {limit} levels deep; refusing to pin it")
+        if isinstance(cur, dict):
+            stack.extend((v, d + 1) for v in cur.values() if isinstance(v, (dict, list)))
+        elif isinstance(cur, list):
+            stack.extend((v, d + 1) for v in cur if isinstance(v, (dict, list)))
+
+
 def canonical(obj: Any) -> Any:
     """Recursively sort dict keys so comparisons ignore insertion order."""
     if isinstance(obj, dict):
@@ -49,23 +70,40 @@ def build_surface(
     tools: List[Dict[str, Any]],
     resources: List[Dict[str, Any]] | None = None,
     prompts: List[Dict[str, Any]] | None = None,
+    templates: List[Dict[str, Any]] | None = None,
 ) -> Dict[str, Any]:
-    """Fold MCP initialize/tools/resources/prompt listings into one comparable surface."""
-    init = init_result or {}
+    """Fold MCP initialize/tools/resources/prompt listings into one comparable surface.
+
+    ``server.instructions`` (text many clients put into the model's context),
+    ``serverInfo`` title/description/websiteUrl and the negotiated
+    ``protocolVersion`` are pinned when the server sends them. Keys are only
+    present when sent, so surfaces from older versions stay comparable.
+    """
+    init = init_result if isinstance(init_result, dict) else {}
+    for part in (init, tools, resources, prompts, templates):
+        check_depth(part)
     info = init.get("serverInfo") if isinstance(init.get("serverInfo"), dict) else {}
     caps = init.get("capabilities") if isinstance(init.get("capabilities"), dict) else {}
-    return canonical(
-        {
-            "server": {
-                "name": info.get("name"),
-                "version": info.get("version"),
-                "capabilities": caps,
-            },
-            "tools": _index_by(tools, "name", "tool#"),
-            "resources": _index_by(resources or [], "uri", "resource#"),
-            "prompts": _index_by(prompts or [], "name", "prompt#"),
-        }
-    )
+    server: Dict[str, Any] = {
+        "name": info.get("name"),
+        "version": info.get("version"),
+        "capabilities": caps,
+    }
+    for k in ("title", "description", "websiteUrl"):
+        if k in info:
+            server[k] = info[k]
+    for k in ("instructions", "protocolVersion"):
+        if k in init:
+            server[k] = init[k]
+    surface = {
+        "server": server,
+        "tools": _index_by(tools, "name", "tool#"),
+        "resources": _index_by(resources or [], "uri", "resource#"),
+        "prompts": _index_by(prompts or [], "name", "prompt#"),
+    }
+    if templates:
+        surface["resourceTemplates"] = _index_by(templates, "uriTemplate", "template#")
+    return canonical(surface)
 
 
 # --------------------------------------------------------------------------
@@ -88,7 +126,7 @@ def surface_digests(surface: Dict[str, Any]) -> Dict[str, Any]:
     tool moved; the whole-surface digest is what ``mcpdrift sign`` signs.
     """
     out: Dict[str, Any] = {"surface": sha256_of(surface)}
-    for section in ("tools", "resources", "prompts"):
+    for section in ("tools", "resources", "prompts", "resourceTemplates"):
         entries = surface.get(section) or {}
         if isinstance(entries, dict):
             out[section] = {name: sha256_of(entries[name]) for name in sorted(entries)}

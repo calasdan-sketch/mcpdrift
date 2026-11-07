@@ -10,11 +10,11 @@ import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from .canon import diff_surfaces, sha256_of, surface_digests
+from .canon import SurfaceError, diff_surfaces, sha256_of, surface_digests
 from .client import PROTOCOL_VERSION, Capture, MCPError, fetch_capture, surface_from_file
 from .render import (render_github, render_json, render_markdown, render_sarif, render_text,
                      stop_commands)
-from .review import Prepared, dynamic_items, prepare, stability_items
+from .review import Prepared, dynamic_items, footprint, prepare, stability_items
 from .risk import SEVERITIES, Assessed, max_severity, rank, scan_surface
 from .sign import SignError, sign_lock, verify_lock
 
@@ -67,7 +67,8 @@ def _capture(args: argparse.Namespace, server_name: Optional[str]) -> Capture:
     for item in args.allow_env or []:
         allow_env += [x.strip() for x in item.split(",") if x.strip()]
     return fetch_capture(server, timeout=args.timeout, protocol_version=args.protocol_version,
-                         samples=args.samples, allow_env=allow_env, allow_insecure=args.allow_insecure_http)
+                         samples=args.samples, allow_env=allow_env, allow_insecure=args.allow_insecure_http,
+                         isolate_env=getattr(args, "isolate_env", False))
 
 
 def _live_surface(args: argparse.Namespace, server_name: Optional[str]) -> Dict[str, Any]:
@@ -293,7 +294,8 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     text = json.dumps(lock, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
     if args.out and args.out != "-":
         _atomic_write(args.out, text)
-        print(f"mcpdrift: wrote {args.out} ({len(surface.get('tools', {}))} tools)", file=sys.stderr)
+        print(f"mcpdrift: wrote {args.out} ({len(surface.get('tools', {}))} tools, "
+              f"{footprint(surface):,} characters of model-visible text)", file=sys.stderr)
         if args.sign_key:
             sig = sign_lock(lock, args.sign_key)
             _atomic_write(args.out + ".sig", sig)
@@ -430,6 +432,21 @@ def cmd_scan(args: argparse.Namespace) -> int:
     return _exit_for(items, args.fail_on)
 
 
+def cmd_diff(args: argparse.Namespace) -> int:
+    """Compare two lockfiles with no server involved (e.g. a PR's lock
+    against the base branch's lock)."""
+    old, new = _read_lock(args.old), _read_lock(args.new)
+    for lk in (old, new):
+        _check_integrity(lk)
+    prep = prepare(old.get("surface", {}), [new.get("surface", {})], (), _ignore_list(args), args.strict)
+    _emit(prep.items, args.format, args.new,
+          extra={"lock": args.new, "server": new.get("server"), "review_token": prep.token,
+                 "cosmetic_ignored": prep.cosmetic_ignored})
+    _append_markdown(args.markdown_out, prep.items, f"mcpdrift diff: {new.get('server') or 'server'}")
+    _write_sarif(args.sarif_out, prep.items, args.new)
+    return _exit_for(prep.items, args.fail_on)
+
+
 def cmd_sign(args: argparse.Namespace) -> int:
     lock = _read_lock(args.lock)
     _check_integrity(lock)
@@ -468,6 +485,9 @@ def _source_args(p: argparse.ArgumentParser, config_required: bool = False) -> N
     p.add_argument("--allow-env", action="append", metavar="NAME",
                    help="environment variable a remote server's headers may reference as ${NAME} "
                         "(repeatable; only for configs you trust)")
+    p.add_argument("--isolate-env", action="store_true",
+                   help="start a stdio server with only a minimal environment (PATH, HOME, TEMP, ...) plus the "
+                        "config's own 'env', so it cannot read your CI secrets")
     p.add_argument("--allow-insecure-http", action="store_true",
                    help="allow plain http:// to a non-loopback host (not recommended)")
 
@@ -536,6 +556,15 @@ def build_parser() -> argparse.ArgumentParser:
     _verify_args(u)
     u.set_defaults(func=cmd_update)
 
+    d = sub.add_parser("diff", help="compare two lockfiles (no server is contacted)")
+    d.add_argument("old", help="the trusted lockfile (e.g. from the base branch)")
+    d.add_argument("new", help="the lockfile to review")
+    d.add_argument("--ignore", action="append", help="glob pattern of paths to ignore (repeatable)")
+    d.add_argument("--ignore-file", metavar="FILE")
+    d.add_argument("--strict", action="store_true", help="compare raw JSON")
+    _output_args(d, "low")
+    d.set_defaults(func=cmd_diff)
+
     sc = sub.add_parser("scan", help="risk-scan a lock or live server for poisoned descriptions")
     _source_args(sc)
     sc.add_argument("--lock", help="scan this lockfile instead of a live server")
@@ -578,7 +607,7 @@ def main(argv: list[str] | None = None) -> int:
     except MCPError as e:
         print(f"mcpdrift: {e}", file=sys.stderr)
         return USAGE_EXIT
-    except SignError as e:
+    except (SignError, SurfaceError) as e:
         print(f"mcpdrift: {e}", file=sys.stderr)
         return USAGE_EXIT
     except _Exit as e:
@@ -592,6 +621,10 @@ def main(argv: list[str] | None = None) -> int:
         return DRIFT_EXIT  # output was cut short: fail closed, never claim "clean"
     except OSError as e:  # unwritable --out, unreadable file, ...
         print(f"mcpdrift: {e}", file=sys.stderr)
+        return USAGE_EXIT
+    except Exception as e:  # noqa: BLE001 - a bug or hostile input: never a clean exit, never a traceback in CI
+        print(f"mcpdrift: internal error ({type(e).__name__}: {str(e)[:200]}); treating as failure. "
+              "Please report it with the listing that triggered it.", file=sys.stderr)
         return USAGE_EXIT
 
 

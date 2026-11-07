@@ -65,8 +65,6 @@ def test_resources_and_prompts_indexed():
 
 
 def test_nested_capability_change():
-    old = surface([BASE[0]])
-    changed = [dict(BASE[0])]
     init_caps = {"tools": {"listChanged": False}}
     a = build_surface({"serverInfo": {"name": "d", "version": "1"}, "capabilities": init_caps}, [BASE[0]])
     b = build_surface({"serverInfo": {"name": "d", "version": "1"}, "capabilities": {"tools": {"listChanged": True}}}, [BASE[0]])

@@ -73,6 +73,13 @@ inputs:
     description: "true to compare raw JSON (no tolerance for reordered lists or whitespace)."
     required: false
     default: "false"
+  isolate-env:
+    description: >-
+      "true" starts a stdio server with a minimal environment (PATH, HOME, TEMP, ...) plus the config's own
+      env, so it cannot read the job's secrets. Recommended; off by default because some servers need
+      variables you have not listed in their config.
+    required: false
+    default: "false"
   python-version:
     description: Python used to run mcpdrift.
     required: false
@@ -111,6 +118,7 @@ runs:
         IN_SAMPLES: ${{ inputs.samples }}
         IN_SARIF: ${{ inputs.sarif-file }}
         IN_STRICT: ${{ inputs.strict }}
+        IN_ISOLATE: ${{ inputs.isolate-env }}
       run: |
         # Inputs arrive via env vars, never interpolated into the script,
         # so a crafted input cannot inject shell commands.
@@ -118,6 +126,7 @@ runs:
               --format github --markdown-out "$GITHUB_STEP_SUMMARY")
         [ -n "$IN_SARIF" ] && args+=(--sarif-out "$IN_SARIF")
         [ "$IN_STRICT" = "true" ] && args+=(--strict)
+        [ "$IN_ISOLATE" = "true" ] && args+=(--isolate-env)
         [ -n "$IN_CONFIG" ] && args+=(--config "$IN_CONFIG")
         [ -n "$IN_FROM_FILE" ] && args+=(--from-file "$IN_FROM_FILE")
         [ -n "$IN_SERVER" ] && args+=(--server "$IN_SERVER")

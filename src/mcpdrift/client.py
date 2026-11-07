@@ -31,6 +31,22 @@ MAX_ITEMS = 50_000
 STDERR_TAIL = 20
 
 
+ISOLATED_ENV_KEEP = {
+    "PATH", "PATHEXT", "HOME", "USER", "USERNAME", "LOGNAME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
+    "SYSTEMROOT", "SYSTEMDRIVE", "COMSPEC", "WINDIR", "TEMP", "TMP", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE",
+    "TERM", "TZ", "SHELL", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "NODE_PATH",
+}
+
+
+def _group_kwargs() -> Dict[str, Any]:
+    """Start the server in its own process group so that its children
+    (``npx`` -> ``node``) can be stopped with it instead of being orphaned."""
+    if os.name == "posix":
+        return {"start_new_session": True}
+    flag = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return {"creationflags": flag} if flag else {}
+
+
 def _sanitize(line: str) -> str:
     """Server stderr is untrusted: drop control characters and defuse
     "::" so it cannot forge GitHub Actions workflow commands."""
@@ -49,10 +65,16 @@ class StdioMCP:
         env: Dict[str, str] | None = None,
         timeout: float = 20.0,
         cwd: str | None = None,
+        isolate_env: bool = False,
     ) -> None:
         if not command:
             raise MCPError("server command is empty")
-        merged = dict(os.environ)
+        if isolate_env:
+            # Do not hand the whole CI environment (tokens!) to the server:
+            # only what a process needs to start, plus the config's own env.
+            merged = {k: v for k, v in os.environ.items() if k.upper() in ISOLATED_ENV_KEEP}
+        else:
+            merged = dict(os.environ)
         merged.update(env or {})
         # Resolve through PATH (and PATHEXT on Windows) so "npx" finds
         # npx.cmd; subprocess without a shell would not.
@@ -67,6 +89,7 @@ class StdioMCP:
                 stderr=subprocess.PIPE,
                 env=merged,
                 cwd=cwd,
+                **_group_kwargs(),
             )
         except OSError as e:
             raise MCPError(f"cannot start {command[0]!r}: {e}") from e
@@ -141,6 +164,12 @@ class StdioMCP:
                 continue  # tolerate non-JSON chatter on stdout
             if isinstance(data, dict) and "id" not in data and isinstance(data.get("method"), str):
                 self.notifications.add(data["method"][:100])
+            elif isinstance(data, dict) and "id" in data and isinstance(data.get("method"), str):
+                # A server-initiated request (ping, roots/list, sampling...).
+                # We advertise no capabilities: answer ping, refuse the rest,
+                # so a server waiting on us cannot stall the listing.
+                self._answer_server_request(data)
+                continue
             if not isinstance(data, dict) or data.get("id") != self._id:
                 continue
             if "error" in data:
@@ -148,23 +177,71 @@ class StdioMCP:
             result = data.get("result")
             return result if isinstance(result, dict) else {}
 
+    def _answer_server_request(self, msg: Dict[str, Any]) -> None:
+        rid = msg.get("id")
+        if not isinstance(rid, (int, str)) or isinstance(rid, bool):
+            return
+        if msg.get("method") == "ping":
+            self._send({"jsonrpc": "2.0", "id": rid, "result": {}})
+        else:
+            self._send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "method not supported"}})
+
     def notify(self, method: str) -> None:  # noqa: D401
         self._send({"jsonrpc": "2.0", "method": method})
+
+    def _kill_group(self) -> None:
+        """Kill the server's whole process group. Only called while the
+        leader is still un-reaped (running, or a zombie), so its pid cannot
+        have been recycled for an unrelated process group."""
+        if os.name == "posix":
+            try:
+                import signal
+
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                return
+            except (OSError, ProcessLookupError):
+                pass
+        try:
+            self.proc.kill()
+        except OSError:
+            pass
+
+    def _wait_noreap(self, timeout: float) -> bool:
+        """Wait for the server to exit without reaping it (POSIX); True if it exited."""
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                if os.waitid(os.P_PID, self.proc.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is not None:
+                    return True
+            except (ChildProcessError, OSError):
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
 
     def close(self) -> None:
         try:
             if self.proc.stdin:
                 self.proc.stdin.close()
-            self.proc.wait(timeout=5)
         except Exception:
-            self.proc.kill()
+            pass
+        try:
+            if os.name == "posix" and hasattr(os, "waitid"):
+                self._wait_noreap(5)  # leader exited or not, it is still un-reaped here
+                self._kill_group()  # sweep children the server left behind (npx -> node)
+                self.proc.wait(timeout=5)
+            else:
+                self.proc.wait(timeout=5)
+        except Exception:
+            self._kill_group()
             try:
                 self.proc.wait(timeout=5)
             except Exception:
                 pass
 
 
-LIST_KEYS = {"tools/list": "tools", "resources/list": "resources", "prompts/list": "prompts"}
+LIST_KEYS = {"tools/list": "tools", "resources/list": "resources", "prompts/list": "prompts",
+             "resources/templates/list": "resourceTemplates"}
 
 
 def _list_or_empty(client: "StdioMCP", method: str) -> List[Dict[str, Any]]:
@@ -229,7 +306,8 @@ class Capture:
 MAX_SAMPLES = 10
 
 
-def _open(server: Dict[str, Any], timeout: float, allow_env: Iterable[str], allow_insecure: bool):
+def _open(server: Dict[str, Any], timeout: float, allow_env: Iterable[str], allow_insecure: bool,
+          isolate_env: bool = False):
     if is_remote(server):
         from .http_client import HttpMCP
 
@@ -252,6 +330,7 @@ def _open(server: Dict[str, Any], timeout: float, allow_env: Iterable[str], allo
         env={str(k): str(v) for k, v in env.items()},
         timeout=timeout,
         cwd=str(cwd) if cwd else None,
+        isolate_env=isolate_env,
     )
 
 
@@ -262,13 +341,14 @@ def fetch_capture(
     samples: int = 1,
     allow_env: Iterable[str] = (),
     allow_insecure: bool = False,
+    isolate_env: bool = False,
 ) -> Capture:
     """Launch (stdio) or connect to (Streamable HTTP) a server and list its
     surface ``samples`` times in one session, so a server that answers
     differently on later calls (a call-count "time bomb") is visible."""
     if not isinstance(samples, int) or isinstance(samples, bool) or not 1 <= samples <= MAX_SAMPLES:
         raise MCPError(f"samples must be between 1 and {MAX_SAMPLES}")
-    client = _open(server, timeout, allow_env, allow_insecure)
+    client = _open(server, timeout, allow_env, allow_insecure, isolate_env)
     try:
         from . import __version__
 
@@ -286,7 +366,8 @@ def fetch_capture(
             tools = _list_or_empty(client, "tools/list")
             resources = _list_or_empty(client, "resources/list")
             prompts = _list_or_empty(client, "prompts/list")
-            taken.append(build_surface(init, tools, resources, prompts))
+            templates = _list_or_empty(client, "resources/templates/list")
+            taken.append(build_surface(init, tools, resources, prompts, templates))
         return Capture(taken[0], taken, set(client.notifications))
     finally:
         client.close()
@@ -338,5 +419,5 @@ def surface_from_file(path: str) -> Dict[str, Any]:
 
     init = data.get("initialize")
     if not isinstance(init, dict):
-        init = {k: data[k] for k in ("serverInfo", "capabilities") if k in data}
-    return build_surface(init, lst("tools"), lst("resources"), lst("prompts"))
+        init = {k: data[k] for k in ("serverInfo", "capabilities", "instructions", "protocolVersion") if k in data}
+    return build_surface(init, lst("tools"), lst("resources"), lst("prompts"), lst("resourceTemplates"))

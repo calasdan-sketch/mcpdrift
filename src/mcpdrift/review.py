@@ -8,7 +8,7 @@ from typing import Any, Dict, Iterable, List, Sequence
 
 from .canon import RawChange, diff_raw, is_missing, sha256_of
 from .normalize import safe_normalize
-from .risk import Assessed, assess_changes
+from .risk import SERVER_TEXT_KEYS, Assessed, assess_changes, iter_texts
 
 _LIST_CHANGED = ("tools/list_changed", "resources/list_changed", "prompts/list_changed")
 
@@ -76,6 +76,34 @@ def dynamic_items(notifications: Iterable[str]) -> List[Assessed]:
     return out
 
 
+def footprint(surface: Dict[str, Any]) -> int:
+    """Characters of text a client may put in the model's context: names,
+    descriptions, schemas' strings, server instructions."""
+    total = 0
+    if not isinstance(surface, dict):
+        return 0
+    srv = surface.get("server")
+    if isinstance(srv, dict):
+        total += sum(len(srv[k]) for k in SERVER_TEXT_KEYS if isinstance(srv.get(k), str))
+    for sec in ("tools", "resources", "prompts", "resourceTemplates"):
+        entries = surface.get(sec)
+        if isinstance(entries, dict):
+            for name, entry in entries.items():
+                total += len(str(name))
+                total += sum(len(t) for _, t in iter_texts(entry))
+    return total
+
+
+def footprint_items(old: Dict[str, Any], new: Dict[str, Any]) -> List[Assessed]:
+    a, b = footprint(old), footprint(new)
+    if b - a >= 2000 and b > a * 1.5:
+        it = Assessed("changed", "server.footprint", ("server", "footprint"), f"{a} -> {b} characters", "low")
+        it.bump("low", f"model-visible text grew from {a:,} to {b:,} characters; every request may carry it "
+                       "(a rough guide is 4 characters per token)", "footprint")
+        return [it]
+    return []
+
+
 def prepare(old: Dict[str, Any], samples: Sequence[Dict[str, Any]], notifications: Iterable[str] = (),
             ignore: Sequence[str] = (), strict: bool = False) -> Prepared:
     """Diff the lock against the live surface and add stability findings."""
@@ -91,6 +119,7 @@ def prepare(old: Dict[str, Any], samples: Sequence[Dict[str, Any]], notification
     items = assess_changes(raw, o, n)
     unst = stability_items(samples, strict, ignore)
     dyn = dynamic_items(notifications)
-    items = items + unst + dyn
-    token = review_token(raw, [i.path + ":" + i.severity for i in unst + dyn])
+    foot = footprint_items(o, n)
+    items = items + unst + dyn + foot
+    token = review_token(raw, [i.path + ":" + i.severity for i in unst + dyn + foot])
     return Prepared(items, raw, bool(unst), cosmetic, token)
