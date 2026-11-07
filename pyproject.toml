@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcpdrift"
-version = "0.2.0"
+version = "0.3.0"
 description = "Pin your MCP servers' tool surface in a lockfile and fail CI when it drifts"
 readme = "README.md"
 requires-python = ">=3.9"

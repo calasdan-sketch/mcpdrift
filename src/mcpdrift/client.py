@@ -13,7 +13,8 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Any, Deque, Dict, List
+from dataclasses import dataclass, field
+from typing import Any, Deque, Dict, Iterable, List, Set
 
 from .canon import build_surface
 
@@ -73,6 +74,7 @@ class StdioMCP:
         self._id = 0
         self._lines: "queue.Queue[str]" = queue.Queue()
         self._stderr: Deque[str] = collections.deque(maxlen=STDERR_TAIL)
+        self.notifications: set = set()  # method names of server notifications seen
         self._reader = threading.Thread(target=self._pump, daemon=True)
         self._reader.start()
         self._err_reader = threading.Thread(target=self._pump_stderr, daemon=True)
@@ -137,6 +139,8 @@ class StdioMCP:
                 data = json.loads(line)
             except (json.JSONDecodeError, RecursionError):
                 continue  # tolerate non-JSON chatter on stdout
+            if isinstance(data, dict) and "id" not in data and isinstance(data.get("method"), str):
+                self.notifications.add(data["method"][:100])
             if not isinstance(data, dict) or data.get("id") != self._id:
                 continue
             if "error" in data:
@@ -196,14 +200,15 @@ def _list_or_empty(client: "StdioMCP", method: str) -> List[Dict[str, Any]]:
     raise MCPError(f"{method}: more than {MAX_PAGES} pages")
 
 
+def is_remote(server: Dict[str, Any]) -> bool:
+    return not server.get("command") and bool(server.get("url") or server.get("type") in ("http", "sse", "streamable-http"))
+
+
 def server_command(server: Dict[str, Any]) -> List[str]:
     command = server.get("command")
     if isinstance(command, str):
         command = [command]
     if not isinstance(command, list) or not command:
-        if server.get("url") or server.get("type") in ("http", "sse", "streamable-http"):
-            raise MCPError("remote (HTTP/SSE) servers are not supported yet; snapshot a saved "
-                           "listing with --from-file instead")
         raise MCPError("server has no 'command'")
     args = server.get("args") or []
     if not isinstance(args, list):
@@ -211,22 +216,59 @@ def server_command(server: Dict[str, Any]) -> List[str]:
     return [str(c) for c in command] + [str(a) for a in args]
 
 
-def fetch_surface(
-    server: Dict[str, Any],
-    timeout: float = 20.0,
-    protocol_version: str = PROTOCOL_VERSION,
-) -> Dict[str, Any]:
-    """Launch an MCP stdio server from config and snapshot its surface."""
+@dataclass
+class Capture:
+    """What a live session returned: the first surface, every later sample,
+    and the notification methods the server sent."""
+
+    surface: Dict[str, Any]
+    samples: List[Dict[str, Any]] = field(default_factory=list)  # samples[0] is surface
+    notifications: Set[str] = field(default_factory=set)
+
+
+MAX_SAMPLES = 10
+
+
+def _open(server: Dict[str, Any], timeout: float, allow_env: Iterable[str], allow_insecure: bool):
+    if is_remote(server):
+        from .http_client import HttpMCP
+
+        if server.get("type") == "sse":
+            raise MCPError("legacy HTTP+SSE servers (type 'sse') are not supported; use a Streamable HTTP "
+                           "URL, or save a tools/list response and use --from-file")
+        url = server.get("url")
+        if not isinstance(url, str):
+            raise MCPError("server 'url' must be a string")
+        hdrs = server.get("headers") or {}
+        if not isinstance(hdrs, dict):
+            raise MCPError("server 'headers' must be an object")
+        return HttpMCP(url, headers=hdrs, timeout=timeout, allow_env=allow_env, allow_insecure=allow_insecure)
     env = server.get("env") or {}
     if not isinstance(env, dict):
         raise MCPError("server 'env' must be an object")
     cwd = server.get("cwd")
-    client = StdioMCP(
+    return StdioMCP(
         server_command(server),
         env={str(k): str(v) for k, v in env.items()},
         timeout=timeout,
         cwd=str(cwd) if cwd else None,
     )
+
+
+def fetch_capture(
+    server: Dict[str, Any],
+    timeout: float = 20.0,
+    protocol_version: str = PROTOCOL_VERSION,
+    samples: int = 1,
+    allow_env: Iterable[str] = (),
+    allow_insecure: bool = False,
+) -> Capture:
+    """Launch (stdio) or connect to (Streamable HTTP) a server and list its
+    surface ``samples`` times in one session, so a server that answers
+    differently on later calls (a call-count "time bomb") is visible."""
+    if not isinstance(samples, int) or isinstance(samples, bool) or not 1 <= samples <= MAX_SAMPLES:
+        raise MCPError(f"samples must be between 1 and {MAX_SAMPLES}")
+    client = _open(server, timeout, allow_env, allow_insecure)
     try:
         from . import __version__
 
@@ -239,12 +281,24 @@ def fetch_surface(
             },
         )
         client.notify("notifications/initialized")
-        tools = _list_or_empty(client, "tools/list")
-        resources = _list_or_empty(client, "resources/list")
-        prompts = _list_or_empty(client, "prompts/list")
-        return build_surface(init, tools, resources, prompts)
+        taken: List[Dict[str, Any]] = []
+        for _ in range(samples):
+            tools = _list_or_empty(client, "tools/list")
+            resources = _list_or_empty(client, "resources/list")
+            prompts = _list_or_empty(client, "prompts/list")
+            taken.append(build_surface(init, tools, resources, prompts))
+        return Capture(taken[0], taken, set(client.notifications))
     finally:
         client.close()
+
+
+def fetch_surface(
+    server: Dict[str, Any],
+    timeout: float = 20.0,
+    protocol_version: str = PROTOCOL_VERSION,
+) -> Dict[str, Any]:
+    """Snapshot a server's surface once (kept for library users)."""
+    return fetch_capture(server, timeout, protocol_version).surface
 
 
 def surface_from_file(path: str) -> Dict[str, Any]:

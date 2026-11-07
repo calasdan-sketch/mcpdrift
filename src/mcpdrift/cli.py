@@ -7,13 +7,15 @@ import json
 import os
 import sys
 import tempfile
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import __version__
-from .canon import diff_raw, diff_surfaces, sha256_of, surface_digests
-from .client import PROTOCOL_VERSION, MCPError, fetch_surface, surface_from_file
-from .render import render_github, render_json, render_markdown, render_text, stop_commands
-from .risk import SEVERITIES, Assessed, assess_changes, max_severity, rank, scan_surface
+from .canon import diff_surfaces, sha256_of, surface_digests
+from .client import PROTOCOL_VERSION, Capture, MCPError, fetch_capture, surface_from_file
+from .render import (render_github, render_json, render_markdown, render_sarif, render_text,
+                     stop_commands)
+from .review import Prepared, dynamic_items, prepare, stability_items
+from .risk import SEVERITIES, Assessed, max_severity, rank, scan_surface
 from .sign import SignError, sign_lock, verify_lock
 
 OK_EXIT = 0
@@ -21,6 +23,7 @@ DRIFT_EXIT = 1
 USAGE_EXIT = 2
 INTEGRITY_EXIT = 3
 LOCKFILE_VERSION = 2
+MAX_HISTORY = 50
 
 
 def load_servers(config_path: str) -> Dict[str, Dict[str, Any]]:
@@ -53,13 +56,22 @@ def pick_server(servers: Dict[str, Dict[str, Any]], name: str | None) -> Dict[st
     return servers[name]
 
 
-def _live_surface(args: argparse.Namespace, server_name: Optional[str]) -> Dict[str, Any]:
+def _capture(args: argparse.Namespace, server_name: Optional[str]) -> Capture:
     if getattr(args, "from_file", None):
-        return surface_from_file(args.from_file)
+        surf = surface_from_file(args.from_file)
+        return Capture(surf, [surf])
     if not args.config:
         raise SystemExit("mcpdrift: give --config (launch the server) or --from-file (saved listing)")
     server = pick_server(load_servers(args.config), server_name)
-    return fetch_surface(server, timeout=args.timeout, protocol_version=args.protocol_version)
+    allow_env: List[str] = []
+    for item in args.allow_env or []:
+        allow_env += [x.strip() for x in item.split(",") if x.strip()]
+    return fetch_capture(server, timeout=args.timeout, protocol_version=args.protocol_version,
+                         samples=args.samples, allow_env=allow_env, allow_insecure=args.allow_insecure_http)
+
+
+def _live_surface(args: argparse.Namespace, server_name: Optional[str]) -> Dict[str, Any]:
+    return _capture(args, server_name).surface
 
 
 def _server_label(args: argparse.Namespace) -> str:
@@ -159,10 +171,20 @@ _SCAN = {"noun": "risk signal(s)"}
 _SCAN_MD = {"noun": "risk signal(s)", "empty": "no risky text signals found"}
 
 
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            return fh.read()
+    except OSError:
+        return ""
+
+
 def _emit(items: List[Assessed], fmt: str, lock_path: str = "", extra: Optional[Dict[str, Any]] = None,
           scan: bool = False) -> None:
     kw = _SCAN if scan else {}
-    if fmt == "json":
+    if fmt == "sarif":
+        sys.stdout.write(render_sarif(items, lock_path, _read_text(lock_path) if lock_path else "", __version__))
+    elif fmt == "json":
         sys.stdout.write(render_json(items, extra))
     elif fmt == "markdown":
         sys.stdout.write(render_markdown(items, **(_SCAN_MD if scan else {})))
@@ -172,6 +194,12 @@ def _emit(items: List[Assessed], fmt: str, lock_path: str = "", extra: Optional[
     else:
         color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
         sys.stdout.write(render_text(items, color=color, **kw))
+
+
+def _write_sarif(path: Optional[str], items: List[Assessed], lock_path: str = "") -> None:
+    if path:
+        _atomic_write(path, render_sarif(items, lock_path, _read_text(lock_path) if lock_path else "",
+                                         __version__))
 
 
 def _append_markdown(path: Optional[str], items: List[Assessed], title: str, scan: bool = False) -> None:
@@ -217,17 +245,49 @@ def _check_rollback(lock: Dict[str, Any], prev_path: str) -> None:
         raise _Exit(INTEGRITY_EXIT, f"mcpdrift: lockfile reuses seq {l_seq} with a different surface")
 
 
-def cmd_snapshot(args: argparse.Namespace) -> int:
-    surface = _live_surface(args, args.server)
-    lock = {
+def _build_lock(args: argparse.Namespace, surface: Dict[str, Any], out: Optional[str],
+                history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    lock: Dict[str, Any] = {
         "mcpdrift": __version__,
         "lockfile_version": LOCKFILE_VERSION,
-        "seq": _previous_seq(args.out) + 1,
+        "seq": _previous_seq(out) + 1,
         "server": _server_label(args),
         "snapshot_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
         "digests": surface_digests(surface),
         "surface": surface,
     }
+    if history:
+        lock["history"] = history[-MAX_HISTORY:]
+    return lock
+
+
+def _warn_risky(surface: Dict[str, Any]) -> None:
+    risky = [a for a in scan_surface(surface) if rank(a.severity) >= rank("high")]
+    if risky:
+        print(
+            f"mcpdrift: warning: {len(risky)} risky text signal(s) in this surface; "
+            "you are pinning it as trusted. Review with `mcpdrift scan`.",
+            file=sys.stderr,
+        )
+
+
+def _unstable_refusal(cap: Capture, strict: bool) -> Optional[List[Assessed]]:
+    items = stability_items(cap.samples, strict)
+    return items or None
+
+
+def cmd_snapshot(args: argparse.Namespace) -> int:
+    cap = _capture(args, args.server)
+    surface = cap.surface
+    if not args.allow_unstable:
+        unstable = _unstable_refusal(cap, False)
+        if unstable:
+            sys.stdout.write(render_text(unstable))
+            print("mcpdrift: the server returned different listings within one session; refusing to pin a "
+                  "surface that is not stable (use --allow-unstable to pin the first listing anyway)",
+                  file=sys.stderr)
+            return DRIFT_EXIT
+    lock = _build_lock(args, surface, args.out)
     # ensure_ascii keeps invisible / look-alike characters visible as \\uXXXX
     # escapes when the lockfile is reviewed in a pull request.
     text = json.dumps(lock, indent=2, sort_keys=True, ensure_ascii=True) + "\n"
@@ -242,14 +302,28 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
         if args.sign_key:
             raise _Exit(USAGE_EXIT, "mcpdrift: --sign-key needs --out FILE")
         sys.stdout.write(text)
-    risky = [a for a in scan_surface(surface) if rank(a.severity) >= rank("high")]
-    if risky:
-        print(
-            f"mcpdrift: warning: {len(risky)} risky text signal(s) in this surface; "
-            "you are pinning it as trusted. Review with `mcpdrift scan`.",
-            file=sys.stderr,
-        )
+    _warn_risky(surface)
     return OK_EXIT
+
+
+def _ignore_list(args: argparse.Namespace) -> List[str]:
+    ignore = list(args.ignore or [])
+    if args.ignore_file:
+        try:
+            with open(args.ignore_file, "r", encoding="utf-8") as fh:
+                ignore += [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
+        except FileNotFoundError:
+            raise _Exit(USAGE_EXIT, f"mcpdrift: ignore file not found: {args.ignore_file}")
+    return ignore
+
+
+def _prepare(args: argparse.Namespace, lock: Dict[str, Any]) -> Tuple[Prepared, Capture]:
+    cap = _capture(args, args.server or lock.get("server") if not args.from_file else args.server)
+    prep = prepare(lock.get("surface", {}), cap.samples, cap.notifications, _ignore_list(args), args.strict)
+    if prep.cosmetic_ignored:
+        print(f"mcpdrift: {prep.cosmetic_ignored} cosmetic-only difference(s) ignored (reordered lists, "
+              "whitespace); use --strict to see them", file=sys.stderr)
+    return prep, cap
 
 
 def cmd_check(args: argparse.Namespace) -> int:
@@ -260,24 +334,80 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"mcpdrift: {verified}", file=sys.stderr)
     if args.previous_lock:
         _check_rollback(lock, args.previous_lock)
-    live = _live_surface(args, args.server or lock.get("server") if not args.from_file else args.server)
-    old = lock.get("surface", {})
-    ignore = list(args.ignore or [])
-    if args.ignore_file:
-        try:
-            with open(args.ignore_file, "r", encoding="utf-8") as fh:
-                ignore += [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
-        except FileNotFoundError:
-            raise _Exit(USAGE_EXIT, f"mcpdrift: ignore file not found: {args.ignore_file}")
     if args.json:
         # Legacy 0.1 output shape, kept byte-compatible for existing scripts.
-        findings = diff_surfaces(old, live, ignore=ignore)
+        live = _live_surface(args, args.server or lock.get("server") if not args.from_file else args.server)
+        findings = diff_surfaces(lock.get("surface", {}), live, ignore=_ignore_list(args))
         print(json.dumps({"drift": bool(findings), "findings": findings}, indent=2))
         return DRIFT_EXIT if findings else OK_EXIT
-    items = assess_changes(diff_raw(old, live, ignore=ignore), old, live)
-    _emit(items, args.format, args.lock, extra={"lock": args.lock, "server": lock.get("server")})
+    prep, _cap = _prepare(args, lock)
+    items = prep.items
+    _emit(items, args.format, args.lock,
+          extra={"lock": args.lock, "server": lock.get("server"), "review_token": prep.token,
+                 "cosmetic_ignored": prep.cosmetic_ignored})
     _append_markdown(args.markdown_out, items, f"mcpdrift: {lock.get('server') or 'server'}")
-    return _exit_for(items, args.fail_on)
+    _write_sarif(args.sarif_out, items, args.lock)
+    code = _exit_for(items, args.fail_on)
+    if items and args.format == "text":
+        print(f"\nreview token: {prep.token}\n"
+              f"to accept this exact drift after reading it: mcpdrift update --lock {args.lock} "
+              f"--approve {prep.token} <same source options>", file=sys.stderr)
+    return code
+
+
+def _clean_name(text: Optional[str]) -> str:
+    return "".join(c for c in (text or "") if c.isprintable())[:80]
+
+
+def cmd_update(args: argparse.Namespace) -> int:
+    """Re-pin after a human has read the drift. Never rewrites silently."""
+    lock = _read_lock(args.lock)
+    _check_integrity(lock)
+    if args.allowed_signers:  # do not build on a lock that is not itself trusted
+        print(f"mcpdrift: {_verify(args, lock)}", file=sys.stderr)
+    prep, cap = _prepare(args, lock)
+    if not prep.items and not prep.raw:
+        print(f"mcpdrift: {args.lock} is already up to date", file=sys.stderr)
+        return OK_EXIT
+    worst = max_severity(a.severity for a in prep.items) or "info"
+    approved = "token" if args.approve and args.approve == prep.token else None
+    if args.approve and not approved:
+        print(f"mcpdrift: --approve {args.approve} does not match the drift seen now ({prep.token}); "
+              "the server changed since you reviewed it, or you approved a different run", file=sys.stderr)
+    if approved is None and rank(worst) <= rank(args.auto_accept):
+        approved = "auto"
+    if approved is None or (prep.unstable and not args.allow_unstable):
+        _emit(prep.items, "text")
+        if prep.unstable and not args.allow_unstable:
+            print("mcpdrift: the server is not stable within one session; refusing to re-pin "
+                  "(--allow-unstable overrides)", file=sys.stderr)
+        else:
+            print(f"mcpdrift: not updated. Read the drift above, then re-run with --approve {prep.token}",
+                  file=sys.stderr)
+        return DRIFT_EXIT
+    history = lock.get("history") if isinstance(lock.get("history"), list) else []
+    entry = {
+        "seq": _previous_seq(args.lock) + 1,
+        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "token": prep.token,
+        "findings": len(prep.items),
+        "max_severity": worst,
+        "approved_by": approved if not args.approver else f"{approved}:{_clean_name(args.approver)}",
+    }
+    new = _build_lock(args, cap.surface, args.lock, [h for h in history if isinstance(h, dict)] + [entry])
+    new["server"] = lock.get("server") or new["server"]
+    _atomic_write(args.lock, json.dumps(new, indent=2, sort_keys=True, ensure_ascii=True) + "\n")
+    print(f"mcpdrift: updated {args.lock} to seq {new['seq']} ({len(prep.items)} finding(s) accepted, "
+          f"worst {worst})", file=sys.stderr)
+    sig_path = args.lock + ".sig"
+    if args.sign_key:
+        _atomic_write(sig_path, sign_lock(new, args.sign_key))
+        print(f"mcpdrift: signed -> {sig_path}", file=sys.stderr)
+    elif os.path.exists(sig_path):
+        print(f"mcpdrift: warning: {sig_path} is now stale; re-sign with `mcpdrift sign` "
+              "(CI with --allowed-signers will fail until you do)", file=sys.stderr)
+    _warn_risky(cap.surface)
+    return OK_EXIT
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
@@ -285,14 +415,18 @@ def cmd_scan(args: argparse.Namespace) -> int:
         lock = _read_lock(args.lock)
         _check_integrity(lock)
         surface = lock.get("surface", {})
+        extra: List[Assessed] = []
     else:
-        surface = _live_surface(args, args.server)
-    items = scan_surface(surface)
+        cap = _capture(args, args.server)
+        surface = cap.surface
+        extra = stability_items(cap.samples, False) + dynamic_items(cap.notifications)
+    items = scan_surface(surface) + extra
     if args.format == "text" and not items:
         print("no risky text signals found")
     else:
         _emit(items, args.format, args.lock or "", scan=True)
     _append_markdown(args.markdown_out, items, "mcpdrift scan", scan=True)
+    _write_sarif(args.sarif_out, items, args.lock or "")
     return _exit_for(items, args.fail_on)
 
 
@@ -328,15 +462,24 @@ def _source_args(p: argparse.ArgumentParser, config_required: bool = False) -> N
     p.add_argument("--timeout", type=float, default=20.0, help="seconds per request (default 20)")
     p.add_argument("--protocol-version", default=PROTOCOL_VERSION,
                    help=f"MCP protocol version to request (default {PROTOCOL_VERSION})")
+    p.add_argument("--samples", type=int, default=3, metavar="N",
+                   help="list the surface N times in one session (1-10, default 3) to catch servers that "
+                        "answer differently on later calls")
+    p.add_argument("--allow-env", action="append", metavar="NAME",
+                   help="environment variable a remote server's headers may reference as ${NAME} "
+                        "(repeatable; only for configs you trust)")
+    p.add_argument("--allow-insecure-http", action="store_true",
+                   help="allow plain http:// to a non-loopback host (not recommended)")
 
 
 def _output_args(p: argparse.ArgumentParser, default_fail: str) -> None:
-    p.add_argument("--format", choices=("text", "json", "markdown", "github"), default="text",
+    p.add_argument("--format", choices=("text", "json", "markdown", "github", "sarif"), default="text",
                    help="output format; 'github' adds workflow annotations")
     p.add_argument("--fail-on", choices=SEVERITIES + ("never",), default=default_fail,
                    help=f"exit 1 only when a finding is at least this severe (default {default_fail})")
     p.add_argument("--markdown-out", metavar="FILE",
                    help="also append a markdown report here (e.g. $GITHUB_STEP_SUMMARY)")
+    p.add_argument("--sarif-out", metavar="FILE", help="also write a SARIF 2.1.0 report here (code scanning)")
 
 
 def _verify_args(p: argparse.ArgumentParser) -> None:
@@ -360,6 +503,8 @@ def build_parser() -> argparse.ArgumentParser:
     _source_args(s)
     s.add_argument("--out", default="-", help="lockfile path (default: stdout)")
     s.add_argument("--sign-key", metavar="KEY", help="SSH private key to sign the lock (writes <out>.sig)")
+    s.add_argument("--allow-unstable", action="store_true",
+                   help="pin even if the server answered differently within one session")
     s.set_defaults(func=cmd_snapshot)
 
     c = sub.add_parser("check", help="diff the live surface against a lockfile; exit 1 on drift")
@@ -372,7 +517,24 @@ def build_parser() -> argparse.ArgumentParser:
                    help="the lock from the base branch; fail (exit 3) if this lock rolls its seq back")
     _output_args(c, "low")
     _verify_args(c)
+    c.add_argument("--strict", action="store_true",
+                   help="compare raw JSON; do not ignore reordered lists or whitespace-only changes")
     c.set_defaults(func=cmd_check)
+
+    u = sub.add_parser("update", help="re-pin the lock after reviewing drift (needs --approve TOKEN)")
+    _source_args(u)
+    u.add_argument("--lock", required=True, help="lockfile to update in place")
+    u.add_argument("--approve", metavar="TOKEN", help="review token printed by `check` for the drift you read")
+    u.add_argument("--auto-accept", choices=SEVERITIES, default="info",
+                   help="accept drift up to this severity without a token (default info: version bumps)")
+    u.add_argument("--approver", help="free-text name recorded in the lock's history")
+    u.add_argument("--ignore", action="append", help="glob pattern of paths to ignore (repeatable)")
+    u.add_argument("--ignore-file", metavar="FILE")
+    u.add_argument("--strict", action="store_true", help="compare raw JSON")
+    u.add_argument("--sign-key", metavar="KEY", help="re-sign the updated lock with this SSH key")
+    u.add_argument("--allow-unstable", action="store_true", help="re-pin even if the server is unstable")
+    _verify_args(u)
+    u.set_defaults(func=cmd_update)
 
     sc = sub.add_parser("scan", help="risk-scan a lock or live server for poisoned descriptions")
     _source_args(sc)

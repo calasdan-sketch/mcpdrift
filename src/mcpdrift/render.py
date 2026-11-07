@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
 import json
+import posixpath
 import re
 import secrets
 from typing import Any, Dict, List, Optional, Sequence
@@ -202,3 +204,111 @@ def render_json(items: Sequence[Assessed], extra: Optional[Dict[str, Any]] = Non
     if extra:
         payload.update(extra)
     return json.dumps(payload, indent=2, sort_keys=False) + "\n"
+
+
+# --------------------------------------------------------------------------
+# SARIF 2.1.0 (GitHub code scanning, GitLab, Azure DevOps, VS Code viewers)
+
+SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+_SARIF_LEVEL = {"critical": "error", "high": "error", "medium": "warning", "low": "note", "info": "note"}
+_SARIF_SCORE = {"critical": "9.5", "high": "8.0", "medium": "5.5", "low": "3.0", "info": "1.0"}
+
+SARIF_RULES = [
+    ("MCPD001", "security-signal", "Text or metadata matches a known tool-poisoning or rug-pull signal"),
+    ("MCPD002", "description-changed", "A description or title the model reads was changed"),
+    ("MCPD003", "breaking-schema-change", "A tool's input contract changed in a way that breaks existing calls"),
+    ("MCPD004", "widened-schema", "A tool's input contract was widened"),
+    ("MCPD005", "entry-added", "A new tool, resource or prompt is now exposed to the agent"),
+    ("MCPD006", "entry-removed", "A tool, resource or prompt was removed"),
+    ("MCPD007", "unstable-listing", "The server answered differently within one session"),
+    ("MCPD008", "dynamic-surface", "The server announced runtime changes to its listing"),
+    ("MCPD009", "other-drift", "Other drift from the locked surface"),
+]
+_RULE_INDEX = {r[0]: i for i, r in enumerate(SARIF_RULES)}
+
+
+def _rule_id(a: Assessed) -> str:
+    tags = set(a.tags)
+    if "unstable" in tags:
+        return "MCPD007"
+    if "dynamic" in tags:
+        return "MCPD008"
+    if "security" in tags:
+        return "MCPD001"
+    if "breaking" in tags and a.kind != "removed":
+        return "MCPD003"
+    if "text" in tags:
+        return "MCPD002"
+    if "added" in tags:
+        return "MCPD005"
+    if "widened" in tags:
+        return "MCPD004"
+    if a.kind == "removed" or "breaking" in tags:
+        return "MCPD006"
+    return "MCPD009"
+
+
+def locate_line(lock_text: str, parts: Sequence[str]) -> int:
+    """Best-effort 1-based line in the lockfile where this entry lives."""
+    if not lock_text or len(parts) < 2 or parts[0] == "unstable":
+        return 1
+    section, name = parts[0], parts[1]
+    lines = lock_text.split("\n")
+    start = 0
+    for i, ln in enumerate(lines):
+        if ln.startswith("    " + json.dumps(section) + ": {"):
+            start = i
+            break
+    needle = "      " + json.dumps(name, ensure_ascii=True) + ": "
+    for i in range(start, len(lines)):
+        if lines[i].startswith(needle):
+            return i + 1
+    return 1
+
+
+def _sarif_uri(path: str) -> str:
+    p = path.replace("\\", "/")
+    if p.startswith("/") or re.match(r"^[A-Za-z]:", p) or ".." in p.split("/"):
+        return posixpath.basename(p) or "mcp.lock.json"
+    return posixpath.normpath(p) if p else "mcp.lock.json"
+
+
+def render_sarif(items: Sequence[Assessed], lock_path: str = "", lock_text: str = "",
+                 tool_version: str = "") -> str:
+    """SARIF 2.1.0 log with one result per finding. Text from the server is
+    escaped (control and invisible characters shown as \\uXXXX)."""
+    uri = _sarif_uri(lock_path or "mcp.lock.json")
+    rules = [
+        {"id": rid, "name": name, "shortDescription": {"text": desc},
+         "defaultConfiguration": {"level": "warning"}}
+        for rid, name, desc in SARIF_RULES
+    ]
+    results = []
+    for a in _sorted(items):
+        rid = _rule_id(a)
+        msg = f"{a.severity.upper()} {a.kind} {_oneline(a.path)}: " + "; ".join(_oneline(r) for r in a.reasons)
+        fp = hashlib.sha256(f"{rid}|{a.kind}|{a.path}|{a.detail}".encode("utf-8", "replace")).hexdigest()
+        results.append({
+            "ruleId": rid,
+            "ruleIndex": _RULE_INDEX[rid],
+            "level": _SARIF_LEVEL[a.severity],
+            "message": {"text": msg.strip().rstrip(":")},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": uri},
+                "region": {"startLine": locate_line(lock_text, a.parts)},
+            }}],
+            "partialFingerprints": {"mcpdrift/v1": fp},
+            "properties": {"severity": a.severity, "security-severity": _SARIF_SCORE[a.severity],
+                           "tags": list(a.tags)},
+        })
+    log = {
+        "$schema": SARIF_SCHEMA,
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {"name": "mcpdrift", "version": tool_version or "0",
+                                "informationUri": "https://github.com/calasdan-sketch/mcpdrift",
+                                "rules": rules}},
+            "results": results,
+        }],
+    }
+    return json.dumps(log, indent=2) + "\n"

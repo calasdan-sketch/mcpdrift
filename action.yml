@@ -59,6 +59,20 @@ inputs:
     description: Seconds per MCP request.
     required: false
     default: "20"
+  samples:
+    description: List the server this many times per run (1-10) to catch call-count rug pulls.
+    required: false
+    default: "3"
+  sarif-file:
+    description: >-
+      Write a SARIF 2.1.0 report here (upload it with github/codeql-action/upload-sarif; that needs
+      security-events: write, which fork pull requests do not get, so rely on annotations there).
+    required: false
+    default: ""
+  strict:
+    description: "true to compare raw JSON (no tolerance for reordered lists or whitespace)."
+    required: false
+    default: "false"
   python-version:
     description: Python used to run mcpdrift.
     required: false
@@ -94,11 +108,16 @@ runs:
         IN_PREV_REF: ${{ inputs.previous-lock-ref }}
         IN_IDENTITY: ${{ inputs.identity }}
         IN_TIMEOUT: ${{ inputs.timeout }}
+        IN_SAMPLES: ${{ inputs.samples }}
+        IN_SARIF: ${{ inputs.sarif-file }}
+        IN_STRICT: ${{ inputs.strict }}
       run: |
         # Inputs arrive via env vars, never interpolated into the script,
         # so a crafted input cannot inject shell commands.
-        args=(check --lock "$IN_LOCK" --fail-on "$IN_FAIL_ON" --timeout "$IN_TIMEOUT"
+        args=(check --lock "$IN_LOCK" --fail-on "$IN_FAIL_ON" --timeout "$IN_TIMEOUT" --samples "$IN_SAMPLES"
               --format github --markdown-out "$GITHUB_STEP_SUMMARY")
+        [ -n "$IN_SARIF" ] && args+=(--sarif-out "$IN_SARIF")
+        [ "$IN_STRICT" = "true" ] && args+=(--strict)
         [ -n "$IN_CONFIG" ] && args+=(--config "$IN_CONFIG")
         [ -n "$IN_FROM_FILE" ] && args+=(--from-file "$IN_FROM_FILE")
         [ -n "$IN_SERVER" ] && args+=(--server "$IN_SERVER")

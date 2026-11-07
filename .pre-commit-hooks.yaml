@@ -1,0 +1,8 @@
+- id: mcpdrift-check
+  name: mcpdrift lockfile check
+  description: Fail when an MCP server's tools/descriptions/schemas drift from the committed lockfile.
+  entry: mcpdrift check --format text
+  language: python
+  pass_filenames: false
+  always_run: true
+  # configure per repo, e.g.  args: [--lock, mcp.lock.json, --from-file, tools-list.json]

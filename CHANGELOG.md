@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 (unreleased)
+
+### Added
+- **Streamable HTTP servers** (`url` + `headers` in the config), JSON or event-stream responses, sessions, pagination. Plain http only to loopback, no redirects, URL credentials refused, `${VAR}` in headers only for `--allow-env` names.
+- **Semantic normalization**: reordered `required`, `enum`, `type` unions and `anyOf`/`oneOf`/`allOf`, and ASCII whitespace-only changes in descriptions, are no longer drift. The lock still stores the raw surface; `--strict` restores exact comparison. Non-ASCII characters are never normalized.
+- **Multi-sample listing** (`--samples`, default 3): a server that answers differently on later listings is reported as `unstable.*` (high or worse, with full text analysis); `snapshot`/`update` refuse to pin it unless `--allow-unstable`. `list_changed` notifications become a `low` finding.
+- **`mcpdrift update`** with a review token bound to the exact drift; auto-accepts only `info` changes; records approvals in `history`; no rewrite when nothing changed.
+- **SARIF 2.1.0** (`--format sarif`, `--sarif-out`), Action inputs `sarif-file`, `samples`, `strict`, and a `.pre-commit-hooks.yaml`.
+- `bench/bench.py` reproducible benchmark.
+
+### Changed
+- `check` JSON output gains `review_token` and `cosmetic_ignored`. `--json` (legacy) is unchanged and compares raw.
+- A config entry with a `url` is now fetched over HTTP instead of failing; `"type": "sse"` still errors, with a clearer message.
+- Default listing count is 3 instead of 1, so a check makes two extra round-trips per section.
+
 ## 0.2.0 (unreleased)
 
 ### Added

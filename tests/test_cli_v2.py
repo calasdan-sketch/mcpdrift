@@ -173,8 +173,8 @@ def test_crash_shows_stderr_tail():
 def test_remote_server_gives_clear_error():
     import pytest
     from mcpdrift.client import MCPError
-    with pytest.raises(MCPError, match="not supported yet"):
-        fetch_surface({"type": "http", "url": "https://example.com/mcp"})
+    with pytest.raises(MCPError, match=r"legacy HTTP\+SSE"):
+        fetch_surface({"type": "sse", "url": "https://example.com/sse"})
 
 
 def test_unwritable_out_is_usage_error(tmp_path):
