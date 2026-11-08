@@ -16,7 +16,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Deque, Dict, Iterable, List, Optional, Set
 
-from .canon import build_surface
+from .canon import DuplicateKeyError, build_surface, strict_load, strict_loads
 
 # Kept at the long-standing revision so existing lockfiles stay stable; servers
 # negotiate, and newer fields (outputSchema, annotations, title) are returned
@@ -179,7 +179,9 @@ class StdioMCP:
             if line == "\x00too-much":
                 raise MCPError(f"server sent more than {MAX_TOTAL_BYTES} bytes in total; refusing to continue")
             try:
-                data = json.loads(line)
+                data = strict_loads(line)
+            except DuplicateKeyError as e:
+                raise MCPError(f"server sent JSON that {e}; refusing to guess which value it meant") from None
             except (json.JSONDecodeError, RecursionError):
                 continue  # tolerate non-JSON chatter on stdout
             if isinstance(data, dict) and "id" not in data and isinstance(data.get("method"), str):
@@ -447,7 +449,7 @@ def surface_from_file(path: str) -> Dict[str, Any]:
         if os.path.getsize(path) > MAX_TOTAL_BYTES:
             raise MCPError(f"listing file is larger than {MAX_TOTAL_BYTES} bytes")
         with open(path, "r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
+            data = strict_load(fh)
     except FileNotFoundError:
         raise MCPError(f"listing file not found: {path}") from None
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as e:

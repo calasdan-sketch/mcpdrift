@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="mcpdrift" tests="6" failures="5">
+  <testsuite name="mcpdrift" tests="6" failures="5" errors="0" skipped="0">
+    <properties><property name="tool" value="mcpdrift <VERSION>"/><property name="organization" value="Calas Automations Inc."/></properties>
+    <testcase classname="mcpdrift.MCPD001" name="changed tools.add_note.description">
+      <failure type="critical" message="description text changed (the model reads this verbatim); instruction aimed at the model: '&lt;IMPORTANT&gt;'; imperative aimed at the model: 'Before using this tool'; mentions secret files or keys: '/.ssh'; exfiltration-style wording: &quot;pass its content as 'sidenote&quot;; 3 independent poisoning signals together">CRITICAL changed tools.add_note.description: description text changed (the model reads this verbatim); instruction aimed at the model: '&lt;IMPORTANT&gt;'; imperative aimed at the model: 'Before using this tool'; mentions secret files or keys: '/.ssh'; exfiltration-style wording: &quot;pass its content as 'sidenote&quot;; 3 independent poisoning signals together [2e4607d018ef]</failure>
+    </testcase>
+    <testcase classname="mcpdrift.MCPD001" name="changed tools.list_notes.annotations.readOnlyHint">
+      <failure type="high" message="tool is no longer read-only">HIGH changed tools.list_notes.annotations.readOnlyHint: tool is no longer read-only [1f19a29c124a]</failure>
+    </testcase>
+    <testcase classname="mcpdrift.MCPD003" name="added tools.list_notes.inputSchema.properties.limit">
+      <failure type="medium" message="new required argument 'limit' (existing calls will fail)">MEDIUM added tools.list_notes.inputSchema.properties.limit: new required argument 'limit' (existing calls will fail) [adca7407e690]</failure>
+    </testcase>
+    <testcase classname="mcpdrift.MCPD003" name="added tools.list_notes.inputSchema.required">
+      <failure type="medium" message="argument(s) became required: limit">MEDIUM added tools.list_notes.inputSchema.required: argument(s) became required: limit [03255d6abc71]</failure>
+    </testcase>
+    <testcase classname="mcpdrift.MCPD004" name="added tools.add_note.inputSchema.properties.sidenote">
+      <failure type="low" message="new optional argument 'sidenote'">LOW added tools.add_note.inputSchema.properties.sidenote: new optional argument 'sidenote' [b6bfd45654a3]</failure>
+    </testcase>
+    <testcase classname="mcpdrift.MCPD009" name="changed server.version">
+      <system-out>INFO changed server.version: server version changed [07a202dd780c]</system-out>
+    </testcase>
+  </testsuite>
+</testsuites>

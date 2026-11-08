@@ -1,6 +1,6 @@
 name: mcpdrift
 description: Fail the build when an MCP server's tools, descriptions or schemas drift from the committed lockfile, with severity-scored, readable findings.
-author: calasdan-sketch
+author: Calas Automations Inc.
 branding:
   icon: lock
   color: orange
@@ -69,6 +69,10 @@ inputs:
       security-events: write, which fork pull requests do not get, so rely on annotations there).
     required: false
     default: ""
+  junit-file:
+    description: Write a JUnit XML report here (for CI test-report viewers). Empty means none.
+    required: false
+    default: ""
   strict:
     description: "true to compare raw JSON (no tolerance for reordered lists or whitespace)."
     required: false
@@ -117,6 +121,7 @@ runs:
         IN_TIMEOUT: ${{ inputs.timeout }}
         IN_SAMPLES: ${{ inputs.samples }}
         IN_SARIF: ${{ inputs.sarif-file }}
+        IN_JUNIT: ${{ inputs.junit-file }}
         IN_STRICT: ${{ inputs.strict }}
         IN_ISOLATE: ${{ inputs.isolate-env }}
       run: |
@@ -125,6 +130,7 @@ runs:
         args=(check --lock "$IN_LOCK" --fail-on "$IN_FAIL_ON" --timeout "$IN_TIMEOUT" --samples "$IN_SAMPLES"
               --format github --markdown-out "$GITHUB_STEP_SUMMARY")
         [ -n "$IN_SARIF" ] && args+=(--sarif-out "$IN_SARIF")
+        [ -n "$IN_JUNIT" ] && args+=(--junit-out "$IN_JUNIT")
         [ "$IN_STRICT" = "true" ] && args+=(--strict)
         [ "$IN_ISOLATE" = "true" ] && args+=(--isolate-env)
         [ -n "$IN_CONFIG" ] && args+=(--config "$IN_CONFIG")

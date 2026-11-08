@@ -1,6 +1,7 @@
 """mcpdrift — pin MCP servers' tool surface, fail CI when it drifts."""
 
 __version__ = "0.3.0"
+__author__ = "Calas Automations Inc."
 
 from .canon import build_surface, diff_raw, diff_surfaces, surface_digests  # noqa: E402
 from .client import Capture, MCPError, fetch_capture, fetch_surface, surface_from_file  # noqa: E402

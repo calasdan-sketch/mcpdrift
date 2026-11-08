@@ -14,6 +14,7 @@ An MCP server's tool names, descriptions and input schemas go straight into your
 - **Severity-graded findings** (`info` → `critical`). A version bump is `info`. A new required argument is `medium` and tagged `breaking`. A description that suddenly mentions `~/.ssh` and tells the model to hide it from the user is `critical`.
 - **Readable diffs.** You get word-level text diffs, and invisible characters show as `\u200b`-style escapes, both in the report and in the lockfile itself.
 - **Signed lockfiles** via `ssh-keygen -Y` (the same SSH key and `allowed_signers` file git uses), so nobody can quietly "re-approve" a poisoned surface.
+- **Reproducible lockfiles.** Set `SOURCE_DATE_EPOCH` and two snapshots of the same surface are byte-identical (the timestamp is the only thing that changes otherwise).
 - **GitHub Action** that writes annotations, a markdown job summary and an optional **SARIF** file for code scanning. A pre-commit hook is included.
 
 ## Quick start
@@ -100,9 +101,11 @@ INFO     changed server.version
 Useful options:
 
 - `--fail-on {info,low,medium,high,critical,never}`: the default for `check` is `low`, so everything except an `info` finding (a bare version bump) fails. Use `--fail-on info` to fail on any drift at all, as 0.1 did, or `--fail-on high` to let routine releases through but stop rug pulls.
-- `--format {text,json,markdown,github,sarif}`, plus `--markdown-out FILE` (point it at `$GITHUB_STEP_SUMMARY`) and `--sarif-out FILE` (SARIF 2.1.0 with one rule per finding class, stable fingerprints, and the line in the lockfile where the entry lives).
+- `--format {text,json,markdown,github,sarif,junit}`, plus `--junit-out FILE` (JUnit XML: one test case per finding, findings at or above `--fail-on` are failures; for Jenkins, GitLab and Azure DevOps test reports; JSON findings carry a `rule` id and a stable `fingerprint`), `--markdown-out FILE` (point it at `$GITHUB_STEP_SUMMARY`) and `--sarif-out FILE` (SARIF 2.1.0 with one rule per finding class, stable fingerprints, and the line in the lockfile where the entry lives).
 - `--samples N` (default 3): list the surface N times in one session. A server that answers differently on a later call is reported under `unstable.*`, and `snapshot` refuses to pin it (`--allow-unstable` overrides). Add `--ignore` globs for fields that legitimately change (a description with today's date). `notifications/*/list_changed` seen during the session is reported as a `low` "dynamic surface" finding.
 - `--isolate-env`: start a stdio server with only a minimal environment (`PATH`, `HOME`, `TEMP` and similar) plus the config's own `env`, so it cannot read your CI secrets. Off by default because some servers need variables you have not listed in their config. The Action input is `isolate-env`.
+- Refused on purpose: **JSON that repeats an object key** (in a lockfile, config, saved listing or a server's reply). Python and JavaScript keep the last value, other readers keep the first, so such a file can show a reviewer one thing and a tool another. It exits `2` with the key name.
+- `snapshot` and `scan` also take `--ignore`/`--ignore-file`: a server whose `_meta` carries a timestamp or counter would otherwise be refused as unstable. Use the same globs on `check`. On `check`, an ignored path is not reported at all, even if someone later puts a poisoned description there, so keep the globs narrow (`snapshot` still warns about risky text in what it pins, and `scan` still reads every field).
 - `--strict`: compare raw JSON, with no tolerance for reordered lists or whitespace.
 - `--ignore 'server.version'` (repeatable) or `--ignore-file .mcpdriftignore`. Globs are matched **one path segment at a time**:
   - `*` never crosses a dot, and `**` matches any depth.
@@ -206,7 +209,7 @@ Tests make sure the following *don't* trigger:
 
 ## How it compares
 
-Every statement below links to the project's own page, as of November 2026. Re-checked on 2026-11-07 from the PyPI pages of mcp-warden-cli (2.2.0), mcp-pin (0.1.8) / heldfast (0.2.3, same description) and mcp-scan (0.4.3). The mcp-scan column was **not** re-checked for features; see the note under the table.
+Every statement below links to the project's own page, as of November 2026. Re-checked on 2026-11-08 from the PyPI pages of mcp-warden-cli (2.2.0), mcp-pin (0.1.8) / heldfast (0.2.3, same description) and snyk-agent-scan (0.6.11, Python 3.10+; only its PyPI text was read, nothing was run). The mcp-scan column was **not** re-checked for features; see the note under the table.
 
 | | mcpdrift | [mcp-scan](https://invariantlabs.ai/blog/introducing-mcp-scan) (Invariant / Snyk; now a redirect to `snyk-agent-scan`) | [mcp-warden-cli](https://pypi.org/project/mcp-warden-cli/) | [mcp-pin](https://pypi.org/project/mcp-pin/0.1.8/) / [heldfast](https://pypi.org/project/heldfast/) | [mcp-tool-pin-check](https://pypi.org/project/mcp-tool-pin-check/) |
 |---|---|---|---|---|---|
@@ -219,6 +222,9 @@ Every statement below links to the project's own page, as of November 2026. Re-c
 | Word-level description diff | yes | – | – | old/new side by side | unified diff |
 | Signed lockfile | SSH (`ssh-keygen -Y`), no extra deps | – | Sigstore (optional extra) | signs logs via external command | no |
 | SARIF output | yes | – | yes (`--sarif`) | not stated | no |
+| JUnit XML output | yes (`--format junit`) | not stated | not stated | not stated | no |
+| Flags text that steers *other* tools (shadowing) | yes, heuristic | lists "Tool Shadowing" among its issue types (`snyk-agent-scan` page) | not stated | not stated | no |
+| Refuses JSON that repeats a key (lock, config, listing, server reply) | yes | not stated | not stated | not stated | not stated |
 | GitHub Action | yes (annotations + summary) | – | yes (SARIF) | yes | no |
 | Ignores harmless list reordering / whitespace | yes (benchmark below) | not stated | not stated | not stated | not stated |
 | Detects a server answering differently within one session | yes (`--samples`) | not stated | not stated | not stated | no |
@@ -247,14 +253,14 @@ Two more checks were added in this release; "before" is the same script run on t
 |---|---|---|
 | Poison hidden in server `instructions` is reported | no (the field was not pinned) | yes |
 | Poison hidden in a resource template is reported | no (not pinned) | yes |
-| 24 injection phrasings detected at `high` or worse | 9/24 | 24/24 |
-| 18 benign look-alike phrases flagged | 0/18 | 0/18 |
+| 28 injection phrasings detected at `high` or worse (round 5 added 4 cross-tool shadowing ones) | 9/24 before round 3; 25/28 before round 5 | 28/28 |
+| 24 benign look-alike phrases flagged (round 5 added 6 mail and tool-chain ones) | 0/18 | 0/24 |
 | `scan` of 500 tools whose text mentions another tool | 8.9 s | 0.4 to 0.7 s (machine and load dependent) |
 | 200,000-character text of `<` followed by spaces | over 10 s (timed out) | 0.3 s |
 
-Round 4 re-ran the whole script before and after its changes: every detection result is identical; only the timings moved, within noise.
+Round 5 added the phrasings above; every other detection result is identical to round 4 and timings are within noise (500-tool scan 0.79 s before, 0.82 s after). Round 4 re-ran the whole script before and after its changes: every detection result is identical; only the timings moved, within noise.
 
-The phrase list is written by the same author as the patterns, so 24/24 shows the patterns do what they say, not how they do on unseen attacks. Treat it as a regression test, not a detection rate.
+The phrase list is written by the same author as the patterns, so 28/28 shows the patterns do what they say, not how they do on unseen attacks. Treat it as a regression test, not a detection rate.
 
 The stability row above is a limit, not a bug: a server that waits long enough can still beat any fixed sample count.
 
@@ -285,4 +291,4 @@ mcpdrift launches the configured server and speaks newline-delimited JSON-RPC ov
 
 ## License
 
-MIT.
+MIT. Copyright (c) 2026 Calas Automations Inc., who maintain this project.

@@ -19,6 +19,38 @@ _MISSING = object()
 MAX_DEPTH = 400
 
 
+class DuplicateKeyError(json.JSONDecodeError):
+    """An object repeats a key. Parsers disagree on which value wins (Python
+    and JavaScript keep the last, others the first), so a lock, config or
+    server reply that repeats a key can show a reviewer one thing and a tool
+    another. Refused, never merged."""
+
+    def __init__(self, key: str) -> None:
+        super().__init__(f"object repeats the key {str(key)[:60]!r} (parsers disagree on which value wins)", "", 0)
+
+    def __str__(self) -> str:
+        return self.msg
+
+
+def _no_dupes(pairs: List[Tuple[str, Any]]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k, v in pairs:
+        if k in out:
+            raise DuplicateKeyError(k)
+        out[k] = v
+    return out
+
+
+def strict_loads(text: str) -> Any:
+    """``json.loads`` that refuses repeated object keys."""
+    return json.loads(text, object_pairs_hook=_no_dupes)
+
+
+def strict_load(fh: Any) -> Any:
+    """``json.load`` that refuses repeated object keys."""
+    return json.loads(fh.read(), object_pairs_hook=_no_dupes)
+
+
 class SurfaceError(ValueError):
     """The listing cannot be pinned safely (for example, absurd nesting)."""
 

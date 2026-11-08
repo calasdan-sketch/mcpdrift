@@ -23,6 +23,7 @@ from .canon import RawChange, brief, is_missing, join_path
 SEVERITIES = ("info", "low", "medium", "high", "critical")
 _STRONG_KINDS = {
     "instruction aimed at the model",
+    "steers other tools (shadowing)",
     "mentions secret files or keys",
     "exfiltration-style wording",
     "contains zero-width / invisible characters",
@@ -166,6 +167,20 @@ _INSTRUCTION_WEAK = re.compile(
     r"|\bthis\s+is\s+(very\s+|extremely\s+)?important\b"
     r"|\b(always|must|should)\s+(use|call|prefer)\s+this\s+tool\s+(instead\s+of|over|rather\s+than|before|first)\b"
     r"|\binstead\s+of\s+(using\s+)?(the\s+|any\s+)?other\s+tools?\b",
+    re.IGNORECASE,
+)
+
+# Cross-tool "shadowing" / "line jumping": text that tells the model how to treat
+# calls to OTHER tools, or to copy mail to an address. A tool has no business
+# steering tools it does not own.
+_SHADOW = re.compile(
+    r"\b(whenever|every\s+time|each\s+time|before|after|when)\s+(you\s+)?(call|use|invoke|run|send|make)\w*\s+"
+    r"(any|every|each|another|all|the\s+other)\s+(other\s+)?(tool|function|server|mcp)\w*"
+    r"[^.\n]{0,80}\b(first|also|include|append|add|pass|send|copy|forward|invoke|call)\b"
+    r"|\b(always|also|additionally|silently)\s+(bcc|cc|forward|copy|redirect|send)\b[^.\n]{0,60}[\w.+-]+@[\w-]+\.[\w.-]+"
+    r"|\b(bcc|redirect)\b[^.\n]{0,40}[\w.+-]+@[\w-]+\.[\w.-]+"
+    r"|\b(override|modify|alter|change|rewrite)s?\b[^.\n]{0,30}\b(behaviou?r|arguments?|parameters?|recipients?)\s+of\s+"
+    r"(the\s+)?(other|any|all)\s+tools?",
     re.IGNORECASE,
 )
 
@@ -415,6 +430,9 @@ def text_signals(text: str, other_names: "Sequence[str] | _Others" = (), allow_u
     m = _INSTRUCTION_WEAK.search(norm)
     if m:
         out.append(("medium", f"imperative aimed at the model: {m.group(0)[:60]!r}"))
+    m = _SHADOW.search(norm)
+    if m:
+        out.append(("high", f"steers other tools (shadowing): {m.group(0)[:60]!r}"))
     m = _SENSITIVE_PATH.search(norm)
     if m:
         out.append(("high", f"mentions secret files or keys: {m.group(0).strip()[:40]!r}"))

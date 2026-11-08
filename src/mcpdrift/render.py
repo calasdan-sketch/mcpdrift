@@ -10,7 +10,9 @@ import re
 import secrets
 from typing import Any, Dict, List, Optional, Sequence
 
-from .risk import Assessed, max_severity
+from .risk import Assessed, max_severity, rank
+
+AUTHOR = "Calas Automations Inc."
 
 _TOKEN = re.compile(r"\s+|\w+|[^\w\s]", re.UNICODE)
 MAX_DIFF_TOKENS = 20_000
@@ -187,6 +189,11 @@ def _jsonable(v: Any) -> Any:
         return repr(v)
 
 
+def fingerprint(a: Assessed) -> str:
+    """Stable id for one finding (same value in SARIF ``partialFingerprints``)."""
+    return hashlib.sha256(f"{_rule_id(a)}|{a.kind}|{a.path}|{a.detail}".encode("utf-8", "replace")).hexdigest()
+
+
 def render_json(items: Sequence[Assessed], extra: Optional[Dict[str, Any]] = None) -> str:
     payload: Dict[str, Any] = {
         "drift": bool(items),
@@ -196,6 +203,8 @@ def render_json(items: Sequence[Assessed], extra: Optional[Dict[str, Any]] = Non
     }
     for a in items:
         d = a.as_dict()
+        d["rule"] = _rule_id(a)
+        d["fingerprint"] = fingerprint(a)
         d["old"] = _jsonable(a.old)
         d["new"] = _jsonable(a.new)
         diff = _text_diff(a)
@@ -295,7 +304,7 @@ def render_sarif(items: Sequence[Assessed], lock_path: str = "", lock_text: str 
     for a in _sorted(items):
         rid = _rule_id(a)
         msg = f"{a.severity.upper()} {a.kind} {_oneline(a.path)}: " + "; ".join(_oneline(r) for r in a.reasons)
-        fp = hashlib.sha256(f"{rid}|{a.kind}|{a.path}|{a.detail}".encode("utf-8", "replace")).hexdigest()
+        fp = fingerprint(a)
         results.append({
             "ruleId": rid,
             "ruleIndex": _RULE_INDEX[rid],
@@ -314,9 +323,57 @@ def render_sarif(items: Sequence[Assessed], lock_path: str = "", lock_text: str 
         "version": "2.1.0",
         "runs": [{
             "tool": {"driver": {"name": "mcpdrift", "version": tool_version or "0",
+                                "organization": AUTHOR,
                                 "informationUri": "https://github.com/calasdan-sketch/mcpdrift",
                                 "rules": rules}},
             "results": results,
         }],
     }
     return json.dumps(log, indent=2) + "\n"
+
+
+# --------------------------------------------------------------------------
+# JUnit XML (Jenkins, GitLab, Azure DevOps, CircleCI test reports)
+
+_XML_BAD = re.compile("[^\u0009\u000a\u000d\u0020-\ud7ff\ue000-\ufffd\U00010000-\U0010ffff]")
+
+
+def _xml_text(text: str) -> str:
+    """Server text made safe for XML 1.0: invisible, control and non-XML
+    characters become visible \\uXXXX escapes, then the XML specials are escaped."""
+    t = _visible(str(text))
+    t = _XML_BAD.sub(lambda m: f"\\u{ord(m.group(0)):04x}", t)
+    return (t.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;").replace("\t", "&#9;").replace("\n", "&#10;"))
+
+
+def render_junit(items: Sequence[Assessed], suite: str = "mcpdrift", fail_on: str = "low",
+                 tool_version: str = "") -> str:
+    """One ``testcase`` per finding; findings at or above ``fail_on`` are
+    ``failure`` elements, the rest are passing cases with their text in
+    ``system-out``. ``fail_on='never'`` fails nothing. No timestamps, so the
+    output is reproducible."""
+    cases = []
+    failures = 0
+    for a in _sorted(items):
+        fails = fail_on != "never" and rank(a.severity) >= rank(fail_on)
+        failures += fails
+        name = _xml_text(f"{a.kind} {a.path}")
+        msg = "; ".join(_oneline(r) for r in a.reasons) or a.severity
+        body = _xml_text(_oneline(f"{a.severity.upper()} {a.kind} {a.path}: {msg} [{fingerprint(a)[:12]}]"))
+        head = f'    <testcase classname="mcpdrift.{_rule_id(a)}" name="{name}">'
+        if fails:
+            cases.append(f'{head}\n      <failure type="{a.severity}" message="{_xml_text(msg)}">{body}</failure>\n'
+                         "    </testcase>")
+        else:
+            cases.append(f"{head}\n      <system-out>{body}</system-out>\n    </testcase>")
+    props = (f'    <properties><property name="tool" value="mcpdrift {_xml_text(tool_version)}"/>'
+             f'<property name="organization" value="{_xml_text(AUTHOR)}"/></properties>\n')
+    n = len(cases)
+    if not n:
+        cases.append(f'    <testcase classname="mcpdrift" name="{_xml_text(suite)}: no findings"/>')
+        n = 1
+    return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+            f'<testsuites name="mcpdrift" tests="{n}" failures="{failures}">\n'
+            f'  <testsuite name="{_xml_text(suite)}" tests="{n}" failures="{failures}" errors="0" skipped="0">\n'
+            + props + "\n".join(cases) + "\n  </testsuite>\n</testsuites>\n")

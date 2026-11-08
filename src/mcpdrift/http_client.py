@@ -27,6 +27,7 @@ import time
 from typing import Any, Dict, Iterable, Optional, Set
 from urllib.parse import urlsplit
 
+from .canon import DuplicateKeyError, strict_loads
 from .client import MAX_LINE_BYTES, MAX_TOTAL_BYTES, MCPError, MCPHTTPError, rpc_error
 
 LOOPBACK = {"localhost", "127.0.0.1", "::1"}
@@ -162,7 +163,9 @@ class HttpMCP:
             raw = "\n".join(data_lines)
             data_lines.clear()
             try:
-                msg = json.loads(raw)
+                msg = strict_loads(raw)
+            except DuplicateKeyError as e:
+                raise MCPError(f"server sent JSON that {e}; refusing to guess which value it meant") from None
             except (ValueError, RecursionError):
                 return None
             for m in (msg if isinstance(msg, list) else [msg]):
@@ -219,7 +222,9 @@ class HttpMCP:
             else:
                 body = self._read_body(resp, MAX_LINE_BYTES)
                 try:
-                    data = json.loads(body.decode("utf-8", "replace"))
+                    data = strict_loads(body.decode("utf-8", "replace"))
+                except DuplicateKeyError as e:
+                    raise MCPError(f"server sent JSON that {e}; refusing to guess which value it meant") from None
                 except (ValueError, RecursionError):
                     raise MCPError(f"{method}: response is not JSON ({ctype or 'no content-type'})") from None
                 if isinstance(data, list):  # a batch: find ours

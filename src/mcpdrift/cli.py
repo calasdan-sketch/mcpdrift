@@ -8,12 +8,12 @@ import os
 import sys
 import tempfile
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
-from .canon import SurfaceError, diff_surfaces, sha256_of, surface_digests
+from .canon import SurfaceError, diff_surfaces, sha256_of, strict_load, surface_digests
 from .client import PROTOCOL_VERSION, Capture, MCPError, fetch_capture, surface_from_file
-from .render import (render_github, render_json, render_markdown, render_sarif, render_text,
+from .render import (render_github, render_junit, render_json, render_markdown, render_sarif, render_text,
                      stop_commands)
 from .review import Prepared, dynamic_items, footprint, prepare, stability_items
 from .risk import SEVERITIES, Assessed, max_severity, rank, scan_surface
@@ -32,7 +32,7 @@ def load_servers(config_path: str) -> Dict[str, Dict[str, Any]]:
     """Read a Claude-Desktop-style or plain {name: server} config."""
     try:
         with open(config_path, "r", encoding="utf-8-sig") as fh:
-            data = json.load(fh)
+            data = strict_load(fh)
     except FileNotFoundError:
         raise _Exit(USAGE_EXIT, f"mcpdrift: config not found: {config_path}")
     except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as e:
@@ -146,7 +146,7 @@ def _atomic_write(path: str, text: str) -> None:
 def _read_lock(path: str) -> Dict[str, Any]:
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
-            lock = json.load(fh)
+            lock = strict_load(fh)
     except FileNotFoundError:
         raise _Exit(USAGE_EXIT, f"mcpdrift: lock not found: {path} (run `mcpdrift snapshot` first)")
     except (json.JSONDecodeError, UnicodeDecodeError) as e:
@@ -225,9 +225,11 @@ def _use_color() -> bool:
 
 
 def _emit(items: List[Assessed], fmt: str, lock_path: str = "", extra: Optional[Dict[str, Any]] = None,
-          scan: bool = False) -> None:
+          scan: bool = False, fail_on: str = "low") -> None:
     kw: Dict[str, Any] = _SCAN if scan else {}
-    if fmt == "sarif":
+    if fmt == "junit":
+        sys.stdout.write(render_junit(items, "mcpdrift scan" if scan else "mcpdrift", fail_on, __version__))
+    elif fmt == "sarif":
         sys.stdout.write(render_sarif(items, lock_path, _read_text(lock_path) if lock_path else "", __version__))
     elif fmt == "json":
         sys.stdout.write(render_json(items, extra))
@@ -239,6 +241,11 @@ def _emit(items: List[Assessed], fmt: str, lock_path: str = "", extra: Optional[
     else:
         color = _use_color()
         sys.stdout.write(render_text(items, color=color, **kw))
+
+
+def _write_junit(path: Optional[str], items: List[Assessed], fail_on: str, scan: bool = False) -> None:
+    if path:
+        _atomic_write(path, render_junit(items, "mcpdrift scan" if scan else "mcpdrift", fail_on, __version__))
 
 
 def _write_sarif(path: Optional[str], items: List[Assessed], lock_path: str = "") -> None:
@@ -269,7 +276,7 @@ def _previous_seq(path: Optional[str]) -> int:
         return 0
     try:
         with open(path, "r", encoding="utf-8-sig") as fh:
-            prev = json.load(fh)
+            prev = strict_load(fh)
         seq = prev.get("seq", 0) if isinstance(prev, dict) else 0
         return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq >= 0 else 0
     except (OSError, ValueError):
@@ -290,6 +297,19 @@ def _check_rollback(lock: Dict[str, Any], prev_path: str) -> None:
         raise _Exit(INTEGRITY_EXIT, f"mcpdrift: lockfile reuses seq {l_seq} with a different surface")
 
 
+def _now() -> str:
+    """UTC time for lock stamps. ``SOURCE_DATE_EPOCH`` (the reproducible-builds
+    convention) pins it so two snapshots of one surface are byte-identical."""
+    raw = os.environ.get("SOURCE_DATE_EPOCH", "")
+    when = None
+    if raw.isascii() and raw.isdigit() and len(raw) <= 11:
+        try:
+            when = datetime.datetime.fromtimestamp(int(raw), datetime.timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            when = None
+    return (when or datetime.datetime.now(datetime.timezone.utc)).isoformat(timespec="seconds")
+
+
 def _build_lock(args: argparse.Namespace, surface: Dict[str, Any], out: Optional[str],
                 history: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     lock: Dict[str, Any] = {
@@ -297,7 +317,7 @@ def _build_lock(args: argparse.Namespace, surface: Dict[str, Any], out: Optional
         "lockfile_version": LOCKFILE_VERSION,
         "seq": _previous_seq(out) + 1,
         "server": _server_label(args),
-        "snapshot_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "snapshot_at": _now(),
         "digests": surface_digests(surface),
         "surface": surface,
     }
@@ -316,8 +336,8 @@ def _warn_risky(surface: Dict[str, Any]) -> None:
         )
 
 
-def _unstable_refusal(cap: Capture, strict: bool) -> Optional[List[Assessed]]:
-    items = stability_items(cap.samples, strict)
+def _unstable_refusal(cap: Capture, strict: bool, ignore: Sequence[str] = ()) -> Optional[List[Assessed]]:
+    items = stability_items(cap.samples, strict, ignore)
     return items or None
 
 
@@ -325,7 +345,7 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
     cap = _capture(args, args.server)
     surface = cap.surface
     if not args.allow_unstable:
-        unstable = _unstable_refusal(cap, False)
+        unstable = _unstable_refusal(cap, False, _ignore_list(args))
         if unstable:
             sys.stdout.write(render_text(unstable))
             print("mcpdrift: the server returned different listings within one session; refusing to pin a "
@@ -353,8 +373,8 @@ def cmd_snapshot(args: argparse.Namespace) -> int:
 
 
 def _ignore_list(args: argparse.Namespace) -> List[str]:
-    ignore = list(args.ignore or [])
-    if args.ignore_file:
+    ignore = list(getattr(args, "ignore", None) or [])
+    if getattr(args, "ignore_file", None):
         try:
             with open(args.ignore_file, "r", encoding="utf-8") as fh:
                 ignore += [ln.strip() for ln in fh if ln.strip() and not ln.lstrip().startswith("#")]
@@ -390,9 +410,10 @@ def cmd_check(args: argparse.Namespace) -> int:
     items = prep.items
     _emit(items, args.format, args.lock,
           extra={"lock": args.lock, "server": lock.get("server"), "review_token": prep.token,
-                 "cosmetic_ignored": prep.cosmetic_ignored})
+                 "cosmetic_ignored": prep.cosmetic_ignored}, fail_on=args.fail_on)
     _append_markdown(args.markdown_out, items, f"mcpdrift: {lock.get('server') or 'server'}")
     _write_sarif(args.sarif_out, items, args.lock)
+    _write_junit(args.junit_out, items, args.fail_on)
     code = _exit_for(items, args.fail_on)
     if items and args.format == "text":
         print(f"\nreview token: {prep.token}\n"
@@ -434,7 +455,7 @@ def cmd_update(args: argparse.Namespace) -> int:
     history: List[Any] = lock["history"] if isinstance(lock.get("history"), list) else []
     entry = {
         "seq": _previous_seq(args.lock) + 1,
-        "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+        "at": _now(),
         "token": prep.token,
         "findings": len(prep.items),
         "max_severity": worst,
@@ -465,14 +486,15 @@ def cmd_scan(args: argparse.Namespace) -> int:
     else:
         cap = _capture(args, args.server)
         surface = cap.surface
-        extra = stability_items(cap.samples, False) + dynamic_items(cap.notifications)
+        extra = stability_items(cap.samples, False, _ignore_list(args)) + dynamic_items(cap.notifications)
     items = scan_surface(surface) + extra
     if args.format == "text" and not items:
         print("no risky text signals found")
     else:
-        _emit(items, args.format, args.lock or "", scan=True)
+        _emit(items, args.format, args.lock or "", scan=True, fail_on=args.fail_on)
     _append_markdown(args.markdown_out, items, "mcpdrift scan", scan=True)
     _write_sarif(args.sarif_out, items, args.lock or "")
+    _write_junit(args.junit_out, items, args.fail_on, scan=True)
     return _exit_for(items, args.fail_on)
 
 
@@ -485,9 +507,10 @@ def cmd_diff(args: argparse.Namespace) -> int:
     prep = prepare(old.get("surface", {}), [new.get("surface", {})], (), _ignore_list(args), args.strict)
     _emit(prep.items, args.format, args.new,
           extra={"lock": args.new, "server": new.get("server"), "review_token": prep.token,
-                 "cosmetic_ignored": prep.cosmetic_ignored})
+                 "cosmetic_ignored": prep.cosmetic_ignored}, fail_on=args.fail_on)
     _append_markdown(args.markdown_out, prep.items, f"mcpdrift diff: {new.get('server') or 'server'}")
     _write_sarif(args.sarif_out, prep.items, args.new)
+    _write_junit(args.junit_out, prep.items, args.fail_on)
     return _exit_for(prep.items, args.fail_on)
 
 
@@ -570,13 +593,14 @@ def _source_args(p: argparse.ArgumentParser, config_required: bool = False) -> N
 
 
 def _output_args(p: argparse.ArgumentParser, default_fail: str) -> None:
-    p.add_argument("--format", choices=("text", "json", "markdown", "github", "sarif"), default="text",
-                   help="output format; 'github' adds workflow annotations")
+    p.add_argument("--format", choices=("text", "json", "markdown", "github", "sarif", "junit"),
+                   default="text", help="output format; 'github' adds workflow annotations")
     p.add_argument("--fail-on", choices=SEVERITIES + ("never",), default=default_fail,
                    help=f"exit 1 only when a finding is at least this severe (default {default_fail})")
     p.add_argument("--markdown-out", metavar="FILE",
                    help="also append a markdown report here (e.g. $GITHUB_STEP_SUMMARY)")
     p.add_argument("--sarif-out", metavar="FILE", help="also write a SARIF 2.1.0 report here (code scanning)")
+    p.add_argument("--junit-out", metavar="FILE", help="also write a JUnit XML report here (CI test reports)")
 
 
 def _verify_args(p: argparse.ArgumentParser) -> None:
@@ -589,8 +613,10 @@ def _verify_args(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="mcpdrift",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Pin an MCP server's tool surface in a lockfile; fail CI when it drifts.",
-        epilog="exit codes: 0 ok, 1 drift at/above --fail-on, 2 usage or server error, "
+        epilog="mcpdrift is maintained by Calas Automations Inc.\n"
+               "exit codes: 0 ok, 1 drift at/above --fail-on, 2 usage or server error, "
                "3 lockfile integrity or signature failure",
     )
     ap.add_argument("--version", action="version", version=f"mcpdrift {__version__}")
@@ -602,6 +628,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sign-key", metavar="KEY", help="SSH private key to sign the lock (writes <out>.sig)")
     s.add_argument("--allow-unstable", action="store_true",
                    help="pin even if the server answered differently within one session")
+    s.add_argument("--ignore", action="append",
+                   help="glob of paths allowed to differ between listings of one session, e.g. '**._meta' "
+                        "(repeatable). The lock still stores what the server sent; pass the same --ignore to check")
+    s.add_argument("--ignore-file", metavar="FILE", help="file of ignore globs, one per line, # comments")
     s.set_defaults(func=cmd_snapshot)
 
     c = sub.add_parser("check", help="diff the live surface against a lockfile; exit 1 on drift")
@@ -645,6 +675,8 @@ def build_parser() -> argparse.ArgumentParser:
     sc = sub.add_parser("scan", help="risk-scan a lock or live server for poisoned descriptions")
     _source_args(sc)
     sc.add_argument("--lock", help="scan this lockfile instead of a live server")
+    sc.add_argument("--ignore", action="append", help="glob of paths allowed to differ between listings (repeatable)")
+    sc.add_argument("--ignore-file", metavar="FILE", help="file of ignore globs, one per line, # comments")
     _output_args(sc, "high")
     sc.set_defaults(func=cmd_scan)
 

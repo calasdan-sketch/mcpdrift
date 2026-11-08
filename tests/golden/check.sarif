@@ -1,0 +1,289 @@
+{
+  "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+  "version": "2.1.0",
+  "runs": [
+    {
+      "tool": {
+        "driver": {
+          "name": "mcpdrift",
+          "version": "<VERSION>",
+          "organization": "Calas Automations Inc.",
+          "informationUri": "https://github.com/calasdan-sketch/mcpdrift",
+          "rules": [
+            {
+              "id": "MCPD001",
+              "name": "security-signal",
+              "shortDescription": {
+                "text": "Text or metadata matches a known tool-poisoning or rug-pull signal"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD002",
+              "name": "description-changed",
+              "shortDescription": {
+                "text": "A description or title the model reads was changed"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD003",
+              "name": "breaking-schema-change",
+              "shortDescription": {
+                "text": "A tool's input contract changed in a way that breaks existing calls"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD004",
+              "name": "widened-schema",
+              "shortDescription": {
+                "text": "A tool's input contract was widened"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD005",
+              "name": "entry-added",
+              "shortDescription": {
+                "text": "A new tool, resource or prompt is now exposed to the agent"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD006",
+              "name": "entry-removed",
+              "shortDescription": {
+                "text": "A tool, resource or prompt was removed"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD007",
+              "name": "unstable-listing",
+              "shortDescription": {
+                "text": "The server answered differently within one session"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD008",
+              "name": "dynamic-surface",
+              "shortDescription": {
+                "text": "The server announced runtime changes to its listing"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            },
+            {
+              "id": "MCPD009",
+              "name": "other-drift",
+              "shortDescription": {
+                "text": "Other drift from the locked surface"
+              },
+              "defaultConfiguration": {
+                "level": "warning"
+              }
+            }
+          ]
+        }
+      },
+      "results": [
+        {
+          "ruleId": "MCPD001",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "CRITICAL changed tools.add_note.description: description text changed (the model reads this verbatim); instruction aimed at the model: '<IMPORTANT>'; imperative aimed at the model: 'Before using this tool'; mentions secret files or keys: '/.ssh'; exfiltration-style wording: \"pass its content as 'sidenote\"; 3 independent poisoning signals together"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "demo.lock.json"
+                },
+                "region": {
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "mcpdrift/v1": "2e4607d018ef7cbfa57665a659f18d529287a2535d965177b80674eb367aded6"
+          },
+          "properties": {
+            "severity": "critical",
+            "security-severity": "9.5",
+            "tags": [
+              "text",
+              "security"
+            ]
+          }
+        },
+        {
+          "ruleId": "MCPD001",
+          "ruleIndex": 0,
+          "level": "error",
+          "message": {
+            "text": "HIGH changed tools.list_notes.annotations.readOnlyHint: tool is no longer read-only"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "demo.lock.json"
+                },
+                "region": {
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "mcpdrift/v1": "1f19a29c124a1da108d77d1a2d41376b95eb239c00e98cc9d7d68ee7426ed2a6"
+          },
+          "properties": {
+            "severity": "high",
+            "security-severity": "8.0",
+            "tags": [
+              "security"
+            ]
+          }
+        },
+        {
+          "ruleId": "MCPD003",
+          "ruleIndex": 2,
+          "level": "warning",
+          "message": {
+            "text": "MEDIUM added tools.list_notes.inputSchema.properties.limit: new required argument 'limit' (existing calls will fail)"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "demo.lock.json"
+                },
+                "region": {
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "mcpdrift/v1": "adca7407e69026f710f0dfe4497bdab862ee6f166be444bf247214c8a46a19aa"
+          },
+          "properties": {
+            "severity": "medium",
+            "security-severity": "5.5",
+            "tags": [
+              "breaking"
+            ]
+          }
+        },
+        {
+          "ruleId": "MCPD003",
+          "ruleIndex": 2,
+          "level": "warning",
+          "message": {
+            "text": "MEDIUM added tools.list_notes.inputSchema.required: argument(s) became required: limit"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "demo.lock.json"
+                },
+                "region": {
+                  "startLine": 9
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "mcpdrift/v1": "03255d6abc71af7ef95167527eb7bb25218794657a5cb84113ca55d0355450cf"
+          },
+          "properties": {
+            "severity": "medium",
+            "security-severity": "5.5",
+            "tags": [
+              "breaking"
+            ]
+          }
+        },
+        {
+          "ruleId": "MCPD004",
+          "ruleIndex": 3,
+          "level": "note",
+          "message": {
+            "text": "LOW added tools.add_note.inputSchema.properties.sidenote: new optional argument 'sidenote'"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "demo.lock.json"
+                },
+                "region": {
+                  "startLine": 8
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "mcpdrift/v1": "b6bfd45654a3f8303bad479ddf047d005d8d7ef8e82c564cfdac6076f617133c"
+          },
+          "properties": {
+            "severity": "low",
+            "security-severity": "3.0",
+            "tags": [
+              "widened"
+            ]
+          }
+        },
+        {
+          "ruleId": "MCPD009",
+          "ruleIndex": 8,
+          "level": "note",
+          "message": {
+            "text": "INFO changed server.version: server version changed"
+          },
+          "locations": [
+            {
+              "physicalLocation": {
+                "artifactLocation": {
+                  "uri": "demo.lock.json"
+                },
+                "region": {
+                  "startLine": 25
+                }
+              }
+            }
+          ],
+          "partialFingerprints": {
+            "mcpdrift/v1": "07a202dd780c1fdb3e859765017fbd8ecb63893fbb0879d80887a12d1d5b4bb2"
+          },
+          "properties": {
+            "severity": "info",
+            "security-severity": "1.0",
+            "tags": []
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,54 @@
+{
+  "digests": {
+    "prompts": {},
+    "resourceTemplates": {},
+    "resources": {},
+    "surface": "75a16e5a75c1c845532847a0969b34f1e4ab0718fc1bad3fba6c25659c72e19f",
+    "tools": {
+      "add_note": "ed2113c2e62e1ca7cfbff1c6e395fd3bdbb2b0001503da1c40f8bb37456b5925",
+      "list_notes": "2e25aca097da17c356213ac43af31a2c91b9eeb44ed87ee435574bfd7930982f"
+    }
+  },
+  "lockfile_version": 2,
+  "mcpdrift": "<VERSION>",
+  "seq": 1,
+  "server": "notes-v1",
+  "snapshot_at": "2023-11-14T22:13:20+00:00",
+  "surface": {
+    "prompts": {},
+    "resources": {},
+    "server": {
+      "capabilities": {
+        "tools": {}
+      },
+      "name": "notes",
+      "version": "1.0.0"
+    },
+    "tools": {
+      "add_note": {
+        "description": "Add a note.",
+        "inputSchema": {
+          "properties": {
+            "text": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text"
+          ],
+          "type": "object"
+        }
+      },
+      "list_notes": {
+        "annotations": {
+          "readOnlyHint": true
+        },
+        "description": "List notes.",
+        "inputSchema": {
+          "properties": {},
+          "type": "object"
+        }
+      }
+    }
+  }
+}

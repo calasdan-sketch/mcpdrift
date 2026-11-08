@@ -2,6 +2,16 @@
 
 ## 0.3.0 (unreleased)
 
+### Round 5: attack surface the earlier rounds missed
+- **Author line**: the package author and maintainer, LICENSE copyright, Action `author`, `mcpdrift.__author__`, the `--help` footer and the SARIF `tool.driver.organization` all say `Calas Automations Inc.`. A test pins it.
+- **Cross-tool shadowing** is now a `high` signal: text that tells the model what to do whenever it calls *other* tools ("whenever you call any other tool, first call this one") or to copy mail to an address ("always BCC x@y"). Benchmark: 28/28 attack phrasings, 0/24 benign false positives.
+- **JSON that repeats an object key is refused** (lockfile, config, saved listing, previous lock, and a server's reply), exit `2`. Before, the last value silently won, so a lock could show a reviewer a clean `surface` and carry a different one later in the file.
+- **`--format junit` / `--junit-out FILE`** (and Action input `junit-file`): one JUnit test case per finding, findings at or above `--fail-on` are failures; control, bidi and non-XML characters are escaped. JSON findings now also carry `rule` (MCPD00x) and a stable `fingerprint`; SARIF uses the same fingerprint.
+- **`SOURCE_DATE_EPOCH`** pins the lock's `snapshot_at`, so two snapshots of one surface are byte-identical. Non-ASCII digits and other junk fall back to the clock.
+- **`snapshot --ignore` / `--ignore-file`** and the same on `scan`: a server whose `_meta` holds a timestamp or counter could never be pinned (it was refused as unstable) and `snapshot` had no way to say so. Pass the same globs to `check`.
+- Quality methods added: property tests (seeded; Hypothesis too when installed), a differential test of the diff against a naive reference, golden files for every output format (`tests/golden/`, regenerate with `MCPDRIFT_UPDATE_GOLDEN=1`), and `bench/mutation_sanity.py` (flips 14 key conditions; every one must make a test fail).
+- Upgrade check: a lock written by the published 0.1.0 still checks and updates with this build (first `check` reports `server.protocolVersion` as `info`); going the other way, 0.1.0 checking a lock made by this build reports `server.protocolVersion` as drift (it does not know the newer fields), so do not mix versions in one CI.
+
 ### Round 4: what a stranger gets from `pip install`
 - **`mcpdrift demo`**: the 10-second example now ships inside the package. Before, the README quick start pointed at `examples/*.json`, which the wheel never contained, so it failed after `pip install`. `demo --dir DIR` keeps the files.
 - **A listing that fails is an error, not "no tools".** A server that timed out, closed its pipe, sent an oversized message, or (over HTTP) answered 500 on `tools/list` used to be recorded as an empty section: `snapshot` would pin zero tools and `check` reported a "removed tool" (medium) that `--fail-on high` let through. Now only a JSON-RPC "method not found" (or any JSON-RPC error for a capability the server never advertised) means "empty". Everything else exits 2 and writes nothing.
